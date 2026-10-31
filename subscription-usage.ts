@@ -24,6 +24,8 @@ interface Limit {
     level: Level;
     /** The limit that holds you back now, when the service says which. */
     binding?: boolean;
+    /** How long the window is, in milliseconds, when the service says: the page ranks plans by their longest one. */
+    windowMs?: number;
 }
 
 /** A prepaid account's balance: money left, not a share of a plan used. */
@@ -408,6 +410,12 @@ function windowLabel(minutes: unknown): string {
     return minutes % 60 === 0 ? `${minutes / 60} hours` : `${minutes} minutes`;
 }
 
+/** A limit's window, in milliseconds, from the minutes that a service gives: none when it gives no length. */
+const windowOf = (minutes: unknown) =>
+    typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0
+        ? { windowMs: minutes * 60_000 }
+        : {};
+
 /** A Z.ai window's length in minutes: unit 3 is hours, 4 days, 5 months, 6 weeks. None for a unit it does not know. */
 function zaiMinutes(unit: unknown, number: unknown): number | undefined {
     if (typeof unit !== "number" || typeof number !== "number" || !(number > 0)) {
@@ -429,6 +437,17 @@ function zaiWindow(unit: unknown, number: unknown): string | undefined {
 
     return minutes === undefined ? undefined : windowLabel(minutes);
 }
+
+/** The plan that Codex names, in the report's title: "ChatGPT Plus". */
+function chatGptName(plan: unknown): string {
+    return typeof plan === "string" && plan.trim() !== ""
+        ? `ChatGPT ${capitalized(plan.trim())}`
+        : "ChatGPT";
+}
+
+/** Anthropic's windows are fixed lengths that its answer does not repeat: a 5-hour session, else a week. */
+const claudeWindowMs = (kind: unknown) =>
+    kind === "session" ? 5 * 3_600_000 : 7 * 24 * 3_600_000;
 
 /** "GrokBuild" as "Grok Build". */
 const spaced = (name: string) => name.replace(/([a-z])([A-Z])/g, "$1 $2");
@@ -725,6 +744,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                             ...resetOf(limit.resets_at),
                             level: levelOf(percent, limit.severity),
                             binding: limit.is_active === true,
+                            windowMs: claudeWindowMs(limit.kind),
                         };
                     });
             } else {
@@ -747,6 +767,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                             percent,
                             ...resetOf(window.resets_at),
                             level: levelOf(percent),
+                            windowMs: claudeWindowMs(field === "five_hour" ? "session" : "weekly_all"),
                         },
                     ];
                 });
@@ -769,7 +790,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
     }
 
     async function chatGpt(signal: AbortSignal): Promise<Report> {
-        const name = "ChatGPT (OpenAI Codex)";
+        const name = "ChatGPT";
 
         try {
             const data = await askCodex(signal, children);
@@ -801,6 +822,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                         percent,
                         ...resetOf(window.resetsAt),
                         level: snapshot.rateLimitReachedType ? "critical" : levelOf(percent),
+                        ...windowOf(window.windowDurationMins),
                     });
                 }
             }
@@ -808,12 +830,6 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
             const plan = snapshots.find((each) => typeof each.planType === "string")?.planType;
             const resets = data.rateLimitResetCredits?.availableCount;
             const credits = snapshots.find((each) => each.credits?.hasCredits === true)?.credits;
-
-            notes.push(
-                typeof plan === "string"
-                    ? `${plan.charAt(0).toUpperCase()}${plan.slice(1)} plan, from the Codex CLI's sign-in.`
-                    : "From the Codex CLI's sign-in.",
-            );
 
             if (data.ordinaryUsageAllowed === false) {
                 notes.push("Codex says the plan's usage is used up for now.");
@@ -831,7 +847,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 notes.push(`${resets} free full reset${resets === 1 ? "" : "s"} available.`);
             }
 
-            return { id: "openai", name, ok: true, limits, notes };
+            return { id: "openai", name: chatGptName(plan), ok: true, limits, notes };
         } catch (error) {
             return { id: "openai", name, ...failure(error) };
         }
@@ -854,11 +870,11 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
 
             const usage = ((await response.json()) as { usage?: Record<string, any> }).usage ?? {};
             const limits = [
-                ["rolling", "5 hours, rolling"],
-                ["weekly", "Week"],
-                ["monthly", "Month"],
-            ].flatMap(([field, label]) => {
-                const window = usage[field!];
+                { field: "rolling", label: "5 hours", minutes: 300, rolling: true },
+                { field: "weekly", label: "Week", minutes: 10_080, rolling: false },
+                { field: "monthly", label: "Month", minutes: 43_200, rolling: false },
+            ].flatMap(({ field, label, minutes, rolling }) => {
+                const window = usage[field];
 
                 if (window === null || typeof window !== "object") {
                     return [];
@@ -869,10 +885,12 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 // Its own word for the state ("ok", or a word for over), else how full it is.
                 return [
                     {
-                        label: label!,
+                        label,
                         percent,
-                        ...resetOf(window.resetsAt),
+                        // A rolling window moves with every call, so it has no single time to name.
+                        ...(rolling ? {} : resetOf(window.resetsAt)),
                         level: levelOf(percent, window.status),
+                        windowMs: minutes * 60_000,
                     },
                 ];
             });
@@ -888,7 +906,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
      * no plan to show (an xAI API key pays as it goes), so the page leaves Grok out.
      */
     async function grok(signal: AbortSignal): Promise<Report | undefined> {
-        const name = "Grok (xAI)";
+        const name = "Grok";
 
         try {
             const found = await signIn("xai", signal);
@@ -933,42 +951,29 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 const percent = percentOf(config.creditUsagePercent);
 
                 limits.push({
-                    label: `${windowLabel(Math.round((end - start) / 60_000))}, shared pool`,
+                    label: windowLabel(Math.round((end - start) / 60_000)),
                     percent,
                     ...resetOf(period.end),
                     level: levelOf(percent),
+                    windowMs: end - start,
                 });
             }
 
             const plan = await tier;
-
-            notes.push(
-                typeof plan === "string" && plan.trim() !== ""
-                    ? `${plan.trim()} plan, from Pi's xAI sign-in.`
-                    : "From Pi's xAI sign-in.",
-            );
-
-            const products = (Array.isArray(config.productUsage) ? config.productUsage : [])
-                .filter(
-                    (each: unknown): each is Record<string, any> =>
-                        each !== null &&
-                        typeof each === "object" &&
-                        typeof (each as any).product === "string",
-                )
-                .map(
-                    (each) =>
-                        `${spaced(each.product)} ${Math.round(percentOf(each.usagePercent))}%`,
-                );
-
-            if (products.length > 0) {
-                notes.push(`Of the pool: ${products.join(", ")}.`);
-            }
-
             const cap = percentOf(config.onDemandCap?.val);
 
-            notes.push(cap > 0 ? `Pay as you go: up to ${cap} credits.` : "Pay as you go is off.");
+            // Only a plan that bought pay-as-you-go credits needs to say so: off is the usual case.
+            if (cap > 0) {
+                notes.push(`Pay as you go: up to ${cap} credits.`);
+            }
 
-            return { id: "xai", name, ok: true, limits, notes };
+            return {
+                id: "xai",
+                name: typeof plan === "string" && plan.trim() !== "" ? plan.trim() : name,
+                ok: true,
+                limits,
+                notes,
+            };
         } catch (error) {
             return { id: "xai", name, ...failure(error) };
         }
@@ -1044,6 +1049,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                         percent,
                         ...resetOfMs(entry.nextResetTime),
                         level: levelOf(percent),
+                        ...windowOf(zaiMinutes(entry.unit, entry.number)),
                     });
                 } else if (type === "TIME_LIMIT") {
                     // Web search, web reader, and Zread calls: a count, not tokens.
@@ -1059,6 +1065,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                         percent,
                         ...resetOfMs(entry.nextResetTime),
                         level: levelOf(percent),
+                        ...windowOf(zaiMinutes(entry.unit, entry.number)),
                     });
                     notes.push(
                         `Web tools: web search, web reader, and Zread calls, for each ${window.toLowerCase()}.`,
@@ -1196,6 +1203,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                         percent,
                         ...resetOfMs(Number(window.end)),
                         level: levelOf(percent),
+                        windowMs: minutes * 60_000,
                     });
                 }
             }
@@ -1295,12 +1303,17 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
             // A paid plan includes credits each month, and its share used is the plan's limit. Pay as you go has none.
             if (allowance > 0) {
                 const percent = Math.min(100, Math.max(0, ((allowance - granted) / allowance) * 100));
+                const from = Date.parse(included.period?.from ?? "");
+                const until = Date.parse(included.period?.until ?? "");
 
                 limits.push({
-                    label: "Month, included",
+                    label: "Month",
                     percent,
                     ...resetOf(included.period?.until),
                     level: levelOf(percent),
+                    ...(Number.isFinite(from) && Number.isFinite(until) && until > from
+                        ? { windowMs: until - from }
+                        : {}),
                 });
             }
 
@@ -1361,6 +1374,11 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                     percent: window,
                     ...resetOfMs(allowance.resetsAtMs),
                     level: levelOf(window),
+                    ...windowOf(
+                        typeof allowance.windowDurationMins === "number"
+                            ? allowance.windowDurationMins
+                            : 300,
+                    ),
                 },
             ];
 
@@ -1372,6 +1390,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                     percent,
                     ...resetOfMs(weekly.resetsAtMs),
                     level: levelOf(percent),
+                    windowMs: 7 * 24 * 3_600_000,
                 });
             }
 
