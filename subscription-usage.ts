@@ -255,6 +255,48 @@ function amountOf(value: unknown): number {
     return Number.isFinite(number) ? Math.max(0, number) : 0;
 }
 
+/** Ollama Cloud's off-peak rates: outside 12:00 to 18:00 UTC on weekdays, and all weekend. */
+function offPeakAt(now: number): { offPeak: boolean; until: number } {
+    const peak = (time: number) => {
+        const at = new Date(time);
+        const day = at.getUTCDay();
+
+        // Saturday and Sunday are off-peak all day; a weekday is full price from 12:00 to 18:00 UTC.
+        return day !== 0 && day !== 6 && at.getUTCHours() >= 12 && at.getUTCHours() < 18;
+    };
+    const full = peak(now);
+    // The hour at which the price next changes: an hour at a time finds it, since a week holds every change.
+    let until = Math.floor(now / 3_600_000) * 3_600_000;
+
+    while (until - now < 8 * 24 * 3_600_000) {
+        until += 3_600_000;
+
+        if (peak(until) !== full) {
+            break;
+        }
+    }
+
+    return { offPeak: !full, until };
+}
+
+/**
+ * The note that says which rates Ollama Cloud charges now, and when that changes: the time in this machine's zone, so
+ * the rate's hours stay in UTC, where Ollama sets them, and the note reads in the day of the person who reads it.
+ */
+function offPeakNote(now: number): string {
+    const { offPeak, until } = offPeakAt(now);
+    const at = new Date(until);
+    const clock = at.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+    const day =
+        at.toDateString() === new Date(now).toDateString()
+            ? ""
+            : `${at.toLocaleDateString("en-US", { weekday: "short" })} `;
+
+    return offPeak
+        ? `Off-peak rates until ${day}${clock}.`
+        : `Full price until ${day}${clock}: off-peak rates after.`;
+}
+
 /** A level from the service's own word for it, else from how full the limit is. */
 function levelOf(percent: number, said?: unknown): Level {
     if (said === "critical" || said === "exceeded" || said === "limited" || said === "blocked") {
@@ -1163,7 +1205,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 name,
                 ok: true,
                 limits,
-                notes: [],
+                notes: [offPeakNote(Date.now())],
                 balance: {
                     currency: "USD",
                     total,
