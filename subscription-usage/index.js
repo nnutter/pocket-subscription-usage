@@ -1,36 +1,31 @@
 // Subscription usage's browser module: a rail button (with the fullest limit on it once one passes 80%), a launcher
-// action, a page set like the home screen's fastfetch: a "usage@pi-pocket" card, then each plan's limits as rows of
-// small squares (the home screen's color swatches) with how full each is and when it resets, and a prepaid account's
-// balance (DeepSeek) as money left. It also adds a status line item with the quota of the current model's provider.
+// action, a page (and a panel) with each plan's limits as rows of small squares (the home screen's color swatches) with
+// how full each is and when it resets, and a prepaid account's balance (DeepSeek, Ollama Cloud) as money left. The plans
+// that are fullest against their window's clock come first, and a footer says how old the reading is. It also adds a
+// status line item with the quota of the current model's provider.
 // The server module asks the services; this only shows what it says.
 
 export const pocketApi = 1;
 
 /** Three bars of rising height, as a 24×24 stroked path like the app's own icons. */
 const BARS = "M5 20v-5M12 20V9M19 20V4M3 20h18";
+/** A circle with a clock's hands, for when a limit resets. */
+const CLOCK = "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18M12 7.5V12l3 2";
 /** A circle with "!" in it, for what went wrong. */
 const ALERT = "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18M12 7.5v5.5M12 16.5v.01";
 /** How often the page reads again while it shows, and the rail's badge in the background. */
 const PAGE_EVERY_MS = 60_000;
+/** How often the age under the plans counts up, between reads. */
+const AGE_EVERY_MS = 30_000;
+/** How often the panel reads again: it stays open across the work, so it asks the services less often than the page. */
+const PANEL_EVERY_MS = 10 * 60_000;
 const BADGE_EVERY_MS = 5 * 60_000;
 /** How often the status item checks the session's model. The check reads the server's cache, never a service. */
 const QUOTA_EVERY_MS = 30_000;
 /** A reset further away than this shows its date, not only its weekday. */
 const NEAR_MS = 6 * 86_400_000;
-/** The words for a level that needs a look, shown in the limit's line of details. An "ok" level has none. */
-const LEVEL_WORDS = { warning: "Warning", critical: "Critical" };
 /** The squares in a gauge: each is 5% of a limit. */
 const CELLS = 20;
-/** Block art for the top of the page, drawn like the home screen's π: three bars of rising height. */
-const GLYPH = [
-    "              ▗██▖",
-    "              ▐██▌",
-    "       ▗██▖   ▐██▌",
-    "       ▐██▌   ▐██▌",
-    "▗██▖   ▐██▌   ▐██▌",
-    "▐██▌   ▐██▌   ▐██▌",
-    "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
-].join("\n");
 /** What "In force" on a limit means. */
 const IN_FORCE = "The limit that holds you back now";
 
@@ -146,10 +141,6 @@ function quotaTitle(report, label, at) {
             parts.push("in force");
         }
 
-        if (LEVEL_WORDS[limit.level]) {
-            parts.push(LEVEL_WORDS[limit.level]);
-        }
-
         if (Number.isFinite(reset) && reset > Date.now()) {
             parts.push(`resets ${untilThen(reset)}`);
         }
@@ -210,27 +201,59 @@ function quotaOf(next) {
     };
 }
 
-/** What the card at the top says: the fullest limit, and the next reset, across the plans that answered. */
-function glance(data) {
-    let top = null;
-    let next = null;
+/** "3m ago" or "just now": how old the reading under the plans is. */
+function ageOf(at) {
+    const seconds = Math.max(0, Math.round((Date.now() - (Number(at) || 0)) / 1000));
 
-    for (const report of data?.reports ?? []) {
-        for (const each of report.ok ? report.limits : []) {
-            const percent = Number(each.percent) || 0;
-            const reset = Date.parse(each.resetsAt ?? "");
+    if (seconds < 45) {
+        return "just now";
+    }
 
-            if (!top || percent > top.percent) {
-                top = { percent, label: each.label, plan: report.name };
-            }
+    const minutes = Math.floor(seconds / 60);
 
-            if (Number.isFinite(reset) && reset > Date.now() && (!next || reset < next.time)) {
-                next = { time: reset, label: each.label, plan: report.name };
-            }
+    if (minutes < 60) {
+        return `${minutes}m ago`;
+    }
+
+    const hours = Math.floor(minutes / 60);
+
+    return hours < 24 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
+}
+
+/** The plans with something to say: an account that is here, and a limit or a balance to show. */
+const kept = (reports) =>
+    (reports ?? []).filter((report) =>
+        report.ok ? report.limits.length > 0 || report.balance : !report.missing,
+    );
+
+/** The limit that says the most about a plan: the one with the longest window, which it runs out of over time. */
+function longest(limits) {
+    let best;
+
+    for (const limit of limits ?? []) {
+        const span = Number(limit.windowMs);
+        const key = Number.isFinite(span) ? span : -1;
+
+        if (best === undefined || key > best.span) {
+            best = { span: key, limit };
         }
     }
 
-    return { top, next };
+    return best?.limit;
+}
+
+/**
+ * Where a plan goes in the list, as two numbers to sort by: the least used of its longest window first. A plan that
+ * only has a balance has no window to compare, and a plan that failed comes after both.
+ */
+function rank(report) {
+    if (!report.ok) {
+        return [2, 0];
+    }
+
+    const limit = longest(report.limits);
+
+    return limit === undefined ? [1, 0] : [0, Number(limit.percent) || 0];
 }
 
 export default function setup(pocket) {
@@ -238,15 +261,15 @@ export default function setup(pocket) {
 
     pocket.style("look.css");
 
-    function LimitRow({ limit }) {
+    /** A plan's limit: its name, a gauge of squares, how full it is, and when it resets, in a word on the right. */
+    function LimitRow({ limit, label = limit.label }) {
         const reset = Date.parse(limit.resetsAt ?? "");
         const percent = Number(limit.percent) || 0;
-        const word = LEVEL_WORDS[limit.level];
         const on = lit(percent);
         const timed = Number.isFinite(reset);
 
         return html`<li class=${`su-limit su-${limit.level}`}>
-            <span class="su-label">${limit.label}</span>
+            <span class="su-label">${label}</span>
             <span class="su-gauge" aria-hidden="true">
                 ${Array.from(
                     { length: CELLS },
@@ -257,65 +280,56 @@ export default function setup(pocket) {
                         ></span>`,
                 )}
             </span>
+            <span class="su-when">
+                ${
+                    limit.binding &&
+                    html`<span class="su-binding" title=${IN_FORCE}>In force</span>`
+                }
+                ${
+                    limit.binding &&
+                    timed &&
+                    html`<span class="su-sep" aria-hidden="true">·</span>`
+                }
+                ${
+                    timed &&
+                    html`<span class="su-resets" title=${when(reset)}
+                        ><${Icon} path=${CLOCK} size=${13} />${untilThen(reset).replace(/^in /, "")}</span
+                    >`
+                }
+            </span>
             <span class="su-value"
                 >${Math.round(percent)}<span class="su-unit">%</span
                 ><span class="su-sr"> used</span></span
             >
-            ${
-                (word || limit.binding || timed) &&
-                html`<p class="su-meta">
-                    ${word && html`<span class=${`su-flag su-${limit.level}`}>${word}</span>`}
-                    ${
-                        word &&
-                        (limit.binding || timed) &&
-                        html`<span class="su-sep" aria-hidden="true">·</span>`
-                    }
-                    ${
-                        limit.binding &&
-                        html`<span class="su-binding" title=${IN_FORCE}>In force</span>`
-                    }
-                    ${
-                        limit.binding &&
-                        timed &&
-                        html`<span class="su-sep" aria-hidden="true">·</span>`
-                    }
-                    ${
-                        timed &&
-                        html`<span class="su-when">
-                            Resets <strong>${untilThen(reset)}</strong> · ${when(reset)}
-                        </span>`
-                    }
-                </p>`
-            }
         </li>`;
     }
 
-    /** A prepaid account: the money left, whether the service will take calls, and what makes it up. */
+    /** A prepaid account: the money left, when it cannot take calls, and what makes it up. */
     function BalanceRow({ balance }) {
+        const total = Number(balance.total) || 0;
         const granted = Number(balance.granted) || 0;
         const toppedUp = Number(balance.toppedUp) || 0;
-        const parts = [];
-
-        if (granted > 0) {
-            parts.push(`Granted ${money(granted, balance.currency)}`);
-        }
-
-        if (toppedUp > 0) {
-            parts.push(`Topped up ${money(toppedUp, balance.currency)}`);
-        }
+        // A part that is the whole balance says nothing: the amount above already says it.
+        const parts = [
+            ["Granted", granted],
+            ["Topped up", toppedUp],
+        ]
+            .filter(([, amount]) => Number(amount) > 0 && Number(amount) !== total)
+            .map(([name, amount]) => `${name} ${money(amount, balance.currency)}`);
 
         return html`<div class=${`su-balance${balance.enough ? "" : " su-critical"}`}>
             <p class="su-balance-amount">
-                <span class="su-sr">Balance </span>${money(balance.total, balance.currency)}
+                <span class="su-sr">Balance </span>${money(total, balance.currency)}
             </p>
-            <span class=${`su-flag${balance.enough ? "" : " su-critical"}`}>
-                ${balance.enough ? "Available" : "Not enough for calls"}
-            </span>
+            ${
+                !balance.enough &&
+                html`<span class="su-flag su-critical">Not enough for calls</span>`
+            }
             ${parts.length > 0 && html`<p class="su-meta">${parts.join(" · ")}</p>`}
         </div>`;
     }
 
-    /** A plan's section: its limits and notes, or why it could not be read. */
+    /** A plan's section: its name, its limits, and what it has to say, or why it could not be read. */
     function Plan({ report, index }) {
         const head = `su-plan-${report.id}`;
         const notes = report.ok ? (report.notes ?? []) : [];
@@ -324,36 +338,29 @@ export default function setup(pocket) {
             <header class="su-plan-head">
                 <h3 id=${head}>${report.name}</h3>
                 <span class="su-rule" aria-hidden="true"></span>
-                ${
-                    report.ok
-                        ? report.limits.length > 0
-                            ? html`<span class="su-count">
-                                  ${report.limits.length} limit${report.limits.length === 1
-                                      ? ""
-                                      : "s"}
-                              </span>`
-                            : report.balance
-                              ? html`<span class="su-count">Balance</span>`
-                              : null
-                        : html`<span class="su-flag su-failed">Unavailable</span>`
-                }
+                ${report.ok ? null : html`<span class="su-flag su-failed">Unavailable</span>`}
             </header>
             ${
                 report.ok
                     ? html`${
-                          report.balance && html`<${BalanceRow} balance=${report.balance} />`
+                          report.balance &&
+                          (report.id !== "ollama" || report.limits.length === 0 ||
+                              report.balance.toppedUp > 0 || !report.balance.enough) &&
+                          html`<${BalanceRow} balance=${report.balance} />`
                       }
                       ${
-                          report.limits.length > 0
-                              ? html`<ul class="su-limits" role="list">
-                                    ${report.limits.map(
-                                        (limit, at) =>
-                                            html`<${LimitRow} key=${at} limit=${limit} />`,
-                                    )}
-                                </ul>`
-                              : report.balance
-                                ? null
-                                : html`<p class="su-empty">No limits reported.</p>`
+                          report.limits.length > 0 &&
+                          html`<ul class="su-limits" role="list">
+                              ${report.limits.map(
+                                  (limit, at) => html`<${LimitRow}
+                                      key=${at}
+                                      limit=${limit}
+                                      label=${report.id === "ollama" && report.balance
+                                          ? `${limit.label} (${money(report.balance.granted, report.balance.currency)})`
+                                          : limit.label}
+                                  />`,
+                              )}
+                          </ul>`
                       }
                       ${
                           notes.length > 0 &&
@@ -369,11 +376,16 @@ export default function setup(pocket) {
         </section>`;
     }
 
-    /** The page: loading, then one list of plans, or what went wrong, with Refresh. Reads again every minute. */
-    function Usage() {
+    /**
+     * The page: loading, then the plans, then how old the reading is, with Refresh. It reads again on its own clock:
+     * `every` is a minute on the page, and longer in the panel, which stays open across the work.
+     */
+    function Usage({ every = PAGE_EVERY_MS }) {
         const [data, setData] = useState(null);
         const [error, setError] = useState(null);
         const [busy, setBusy] = useState(false);
+        // The age under the plans ticks on its own, so a read that failed leaves a reading that still counts up.
+        const [, setTick] = useState(0);
 
         const load = async (fresh, signal) => {
             setBusy(true);
@@ -401,11 +413,13 @@ export default function setup(pocket) {
             const stop = new AbortController();
 
             void load(false, stop.signal);
-            const timer = setInterval(() => void load(false, stop.signal), PAGE_EVERY_MS);
+            const timer = setInterval(() => void load(false, stop.signal), every);
+            const tick = setInterval(() => setTick((count) => count + 1), AGE_EVERY_MS);
 
             return () => {
                 stop.abort();
                 clearInterval(timer);
+                clearInterval(tick);
             };
         }, []);
 
@@ -436,99 +450,59 @@ export default function setup(pocket) {
             </div>`;
         }
 
-        const read = new Date(data.at);
-        const stamp = read.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-        const iso = Number.isFinite(read.getTime()) ? read.toISOString() : undefined;
-        const { top, next } = glance(data);
-        const wallet = (data.reports ?? []).find((report) => report.ok && report.balance);
+        // The plans that have something to say, the fullest against its window's clock first.
+        const shown = kept(data.reports)
+            .map((report) => ({ report, key: rank(report) }))
+            .sort((a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1])
+            .map(({ report }) => report);
 
         return html`<div class="su" aria-busy=${busy ? "true" : undefined}>
-            <div class="su-fetch">
-                <pre class="su-glyph" aria-hidden="true">${GLYPH}</pre>
-                <div class="su-info">
-                    <div class="su-title">
-                        <span class="su-host"><b>usage</b>@pi-pocket</span>
-                        <button
-                            class="button small su-refresh"
-                            aria-disabled=${busy ? "true" : "false"}
-                            onClick=${() => !busy && load(true)}
-                        >
-                            ${
-                                busy
-                                    ? html`<span class="su-spin" aria-hidden="true"
-                                          ><${Spinner}
-                                      /></span>`
-                                    : html`<${Icon} name="reload" size=${14} />`
-                            }
-                            ${busy ? "Refreshing…" : "Refresh"}
-                        </button>
-                    </div>
-                    <dl class="su-rows">
-                        <div class="su-row" style="--i:1">
-                            <dt>read</dt>
-                            <dd><time datetime=${iso}>${stamp}</time></dd>
-                        </div>
-                        ${
-                            top &&
-                            html`<div class="su-row" style="--i:2">
-                                <dt>fullest</dt>
-                                <dd>
-                                    <b>${Math.round(top.percent)}%</b>
-                                    <span class="su-quiet">${" "}· ${top.label}, ${top.plan}</span>
-                                </dd>
-                            </div>`
-                        }
-                        ${
-                            next &&
-                            html`<div class="su-row" style="--i:3">
-                                <dt>resets</dt>
-                                <dd>
-                                    <b>${untilThen(next.time)}</b>
-                                    <span class="su-quiet"
-                                        >${" "}· ${next.label}, ${next.plan}</span
-                                    >
-                                </dd>
-                            </div>`
-                        }
-                        ${
-                            wallet &&
-                            html`<div class="su-row" style="--i:4">
-                                <dt>balance</dt>
-                                <dd>
-                                    <b>${money(wallet.balance.total, wallet.balance.currency)}</b>
-                                    <span class="su-quiet">${" "}· ${wallet.name}</span>
-                                </dd>
-                            </div>`
-                        }
-                    </dl>
-                    ${
-                        top &&
-                        html`<div class="su-key" style="--i:5" aria-hidden="true">
-                            <span class="su-swatch"></span>ok
-                            <span class="su-swatch su-warning"></span>warning
-                            <span class="su-swatch su-critical"></span>critical
-                        </div>`
-                    }
-                </div>
-            </div>
             ${
                 error &&
                 html`<p class="error-box small" role="alert">Could not refresh: ${error}</p>`
             }
             ${
-                data.reports.length === 0
-                    ? html`<p class="su-empty">No plans reported.</p>`
-                    : data.reports.map(
+                shown.length === 0
+                    ? html`<p class="su-empty">No plans reported: sign in under Menu → Providers.</p>`
+                    : shown.map(
                           (report, at) =>
-                              html`<${Plan} key=${report.id} report=${report} index=${at + 2} />`,
+                              html`<${Plan} key=${report.id} report=${report} index=${at} />`,
                       )
             }
+            <footer class="su-foot">
+                <span class="su-age" aria-live="polite">${ageOf(data.at)}</span>
+                <button
+                    class="button small su-refresh"
+                    style=${{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        flex: "none",
+                        width: "28px",
+                        height: "28px",
+                        padding: "0",
+                    }}
+                    aria-disabled=${busy ? "true" : "false"}
+                    aria-label="Refresh"
+                    title="Read your plans again"
+                    onClick=${() => !busy && load(true)}
+                >
+                    ${
+                        busy
+                            ? html`<span class="su-spin" aria-hidden="true"><${Spinner} /></span>`
+                            : html`<${Icon} name="reload" size=${16} />`
+                    }
+                </button>
+            </footer>
         </div>`;
     }
 
+    /** The panel's own copy of the page: it stays open across the work, so it reads again every 10 minutes. */
+    const Docked = () => html`<${Usage} every=${PANEL_EVERY_MS} />`;
+
     const rail = pocket.rail({
         id: "usage",
-        title: "Subscription usage",
+        title: "Quotas",
         iconPath: BARS,
         page: "usage",
     });
@@ -540,11 +514,24 @@ export default function setup(pocket) {
         rail.update({ badge: top >= 80 ? top : null });
     }
 
-    pocket.page({ id: "usage", title: "Subscription usage", component: Usage });
+    pocket.page({ id: "usage", title: "Quotas", component: Usage });
+
+    // The same page beside the conversation, where the app's own Browser and Files panels dock: one tap on the status
+    // line's quota shows it. A panel is experimental, so an older app gets the page alone.
+    const docks = typeof pocket.panel === "function";
+
+    if (docks) {
+        pocket.panel({
+            id: "usage",
+            title: "Quotas",
+            iconPath: BARS,
+            component: Docked,
+        });
+    }
     pocket.launcher({
         id: "usage",
-        label: "Subscription usage",
-        detail: "Plan limits and the DeepSeek balance",
+        label: "Quotas",
+        detail: "Plan limits and prepaid balances",
         iconPath: BARS,
         keywords: [
             "anthropic",
@@ -559,6 +546,9 @@ export default function setup(pocket) {
             "glm",
             "minimax",
             "deepseek",
+            "ollama",
+            "muse",
+            "meta",
             "balance",
             "credit",
             "quota",
@@ -600,6 +590,7 @@ export default function setup(pocket) {
                     short: quota.short,
                     title: quota.title,
                     tone: quota.tone,
+                    ...(docks ? { panel: "usage" } : {}),
                 });
             } else {
                 item.update(quota);

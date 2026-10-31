@@ -1,8 +1,8 @@
 /**
- * Subscription usage: a page on the rail with how much of your Claude, ChatGPT (Codex), OpenCode Go, Grok, Z.ai, and
- * MiniMax plans is used, and when each limit resets, plus the DeepSeek balance when Pi has a DeepSeek key. The server
- * asks each service with the sign-ins already on this machine, so no key or token reaches the browser. The command
- * `/usage-plans` posts the same usage as a card in the session.
+ * Subscription usage: a page on the rail with how much of your Claude, ChatGPT (Codex), OpenCode Go, Grok, Z.ai,
+ * MiniMax, and Muse Code plans is used, and when each limit resets, plus the DeepSeek and Ollama Cloud balances when Pi
+ * has a key for them. The server asks each service with the sign-ins already on this machine, so no key or token
+ * reaches the browser. The command `/usage-plans` posts the same usage as a card in the session.
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { homedir } from "node:os";
@@ -24,6 +24,8 @@ interface Limit {
     level: Level;
     /** The limit that holds you back now, when the service says which. */
     binding?: boolean;
+    /** How long the window is, in milliseconds, when the service says: the page ranks plans by their longest one. */
+    windowMs?: number;
 }
 
 /** A prepaid account's balance: money left, not a share of a plan used. */
@@ -38,7 +40,7 @@ interface Balance {
 
 type Report =
     | { id: string; name: string; ok: true; limits: Limit[]; notes: string[]; balance?: Balance }
-    | { id: string; name: string; ok: false; error: string };
+    | { id: string; name: string; ok: false; error: string; missing?: boolean };
 
 type OkReport = Extract<Report, { ok: true }>;
 
@@ -55,6 +57,9 @@ const PROVIDER_REPORTS: Record<string, { report: string; label: string }> = {
     zai: { report: "zai", label: "Z.ai" },
     minimax: { report: "minimax", label: "MiniMax" },
     deepseek: { report: "deepseek", label: "DeepSeek" },
+    "ollama-cloud": { report: "ollama", label: "Ollama" },
+    ollama: { report: "ollama", label: "Ollama" },
+    meta: { report: "muse", label: "Muse" },
 };
 
 /** How long each service may take to answer. */
@@ -74,6 +79,10 @@ const ZAI_QUOTA = "https://api.z.ai/api/monitor/usage/quota/limit";
 const ZAI_PLANS = "https://api.z.ai/api/biz/subscription/list";
 /** MiniMax's Coding Plan lanes, as its own Coding Plan page reads them. */
 const MINIMAX_REMAINS = "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
+/** Ollama Cloud's credits: the included allowance, the credits purchased, and the month that the allowance covers. */
+const OLLAMA_BALANCE = "https://ollama.com/api/balance";
+/** The key that a local Ollama endpoint usually gets: Ollama ignores it, and no account stands behind it. */
+const OLLAMA_LOCAL_KEY = "ollama";
 /** Z.ai's units for a window's length, in minutes (5 is a month, named on its own). */
 const ZAI_UNIT_MINUTES: Record<number, number> = { 3: 60, 4: 1440, 6: 10_080 };
 
@@ -128,7 +137,9 @@ function money(amount: number, currency: string): string {
  * margin tells what color tells on the page: `!` for a warning, `!!` for critical, `▸` the limit in force.
  */
 export function usageCard(data: { at: number; reports: Report[] }, now = Date.now()): string {
-    const rows = data.reports.flatMap((report) => (report.ok ? report.limits : []));
+    // A service that this machine has no account for is no news in a card that others read: the page still says so.
+    const shown = data.reports.filter((report) => report.ok || !report.missing);
+    const rows = shown.flatMap((report) => (report.ok ? report.limits : []));
     const label = Math.min(16, Math.max(8, ...rows.map((each) => shortLabel(each.label).length)));
     const resets = rows.map((each) => Date.parse(each.resetsAt ?? ""));
     const reset = Math.max(
@@ -144,7 +155,7 @@ export function usageCard(data: { at: number; reports: Report[] }, now = Date.no
     const rule = (name: string, tag = "") =>
         `${name} ${"─".repeat(Math.max(3, width - name.length - (tag ? tag.length + 2 : 1)))}${tag ? ` ${tag}` : ""}`;
 
-    for (const report of data.reports) {
+    for (const report of shown) {
         if (!report.ok) {
             lines.push(rule(report.name, "unavailable"), `   ${report.error}`);
 
@@ -202,7 +213,7 @@ export function usageCard(data: { at: number; reports: Report[] }, now = Date.no
         }
     }
 
-    if (data.reports.length === 0) {
+    if (shown.length === 0) {
         lines.push("No plans reported: sign in under Menu → Providers.");
     }
 
@@ -233,7 +244,18 @@ export function usageCard(data: { at: number; reports: Report[] }, now = Date.no
 }
 
 /** Words this module wrote itself, safe to show. Anything else that goes wrong is told in fixed words. */
-class Said extends Error {}
+class Said extends Error {
+    /** This machine has no account for the service, so a card that others read leaves the service out. */
+    readonly missing: boolean;
+
+    constructor(message: string, missing = false) {
+        super(message);
+        this.missing = missing;
+    }
+}
+
+/** A failure that means no account for the service is on this machine: no sign-in, no key, or no command. */
+const missing = (message: string) => new Said(message, true);
 
 /** A percent from a service: a finite number, else 0. */
 function percentOf(value: unknown): number {
@@ -247,6 +269,48 @@ function amountOf(value: unknown): number {
     const number = Number(value);
 
     return Number.isFinite(number) ? Math.max(0, number) : 0;
+}
+
+/** Ollama Cloud's off-peak rates: outside 12:00 to 18:00 UTC on weekdays, and all weekend. */
+function offPeakAt(now: number): { offPeak: boolean; until: number } {
+    const peak = (time: number) => {
+        const at = new Date(time);
+        const day = at.getUTCDay();
+
+        // Saturday and Sunday are off-peak all day; a weekday is full price from 12:00 to 18:00 UTC.
+        return day !== 0 && day !== 6 && at.getUTCHours() >= 12 && at.getUTCHours() < 18;
+    };
+    const full = peak(now);
+    // The hour at which the price next changes: an hour at a time finds it, since a week holds every change.
+    let until = Math.floor(now / 3_600_000) * 3_600_000;
+
+    while (until - now < 8 * 24 * 3_600_000) {
+        until += 3_600_000;
+
+        if (peak(until) !== full) {
+            break;
+        }
+    }
+
+    return { offPeak: !full, until };
+}
+
+/**
+ * The note that says which rates Ollama Cloud charges now, and when that changes: the time in this machine's zone, so
+ * the rate's hours stay in UTC, where Ollama sets them, and the note reads in the day of the person who reads it.
+ */
+function offPeakNote(now: number): string {
+    const { offPeak, until } = offPeakAt(now);
+    const at = new Date(until);
+    const clock = at.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+    const day =
+        at.toDateString() === new Date(now).toDateString()
+            ? ""
+            : `${at.toLocaleDateString("en-US", { weekday: "short" })} `;
+
+    return offPeak
+        ? `Off-peak rates until ${day}${clock}.`
+        : `Full price until ${day}${clock}: off-peak rates after.`;
 }
 
 /** A level from the service's own word for it, else from how full the limit is. */
@@ -280,6 +344,16 @@ function resetOf(value: unknown): { resetsAt?: string } {
     return Number.isFinite(time) && Math.abs(time) <= 8.64e15
         ? { resetsAt: new Date(time).toISOString() }
         : {};
+}
+
+/** A report that failed: what its line in the card says, in the words that `failed` chose, and whether a card must
+ * leave it out. */
+function failure(error: unknown): { ok: false; error: string; missing?: boolean } {
+    return {
+        ok: false,
+        error: failed(error),
+        ...(error instanceof Said && error.missing ? { missing: true } : {}),
+    };
 }
 
 /** A service's failure in words for its card, which names the service: never what the service sent back. */
@@ -336,20 +410,44 @@ function windowLabel(minutes: unknown): string {
     return minutes % 60 === 0 ? `${minutes / 60} hours` : `${minutes} minutes`;
 }
 
-/** A Z.ai window as people read it: unit 3 is hours, 4 days, 5 months, 6 weeks. None for a unit it does not know. */
-function zaiWindow(unit: unknown, number: unknown): string | undefined {
+/** A limit's window, in milliseconds, from the minutes that a service gives: none when it gives no length. */
+const windowOf = (minutes: unknown) =>
+    typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0
+        ? { windowMs: minutes * 60_000 }
+        : {};
+
+/** A Z.ai window's length in minutes: unit 3 is hours, 4 days, 5 months, 6 weeks. None for a unit it does not know. */
+function zaiMinutes(unit: unknown, number: unknown): number | undefined {
     if (typeof unit !== "number" || typeof number !== "number" || !(number > 0)) {
         return undefined;
     }
 
-    if (unit === 5) {
+    const minutes = unit === 5 ? 43_200 : ZAI_UNIT_MINUTES[unit];
+
+    return minutes === undefined ? undefined : minutes * number;
+}
+
+/** A Z.ai window as people read it: unit 3 is hours, 4 days, 5 months, 6 weeks. None for a unit it does not know. */
+function zaiWindow(unit: unknown, number: unknown): string | undefined {
+    if (unit === 5 && typeof number === "number" && number > 0) {
         return number === 1 ? "Month" : `${number} months`;
     }
 
-    const minutes = ZAI_UNIT_MINUTES[unit];
+    const minutes = zaiMinutes(unit, number);
 
-    return minutes === undefined ? undefined : windowLabel(minutes * number);
+    return minutes === undefined ? undefined : windowLabel(minutes);
 }
+
+/** The plan that Codex names, in the report's title: "ChatGPT Plus". */
+function chatGptName(plan: unknown): string {
+    return typeof plan === "string" && plan.trim() !== ""
+        ? `ChatGPT ${capitalized(plan.trim())}`
+        : "ChatGPT";
+}
+
+/** Anthropic's windows are fixed lengths that its answer does not repeat: a 5-hour session, else a week. */
+const claudeWindowMs = (kind: unknown) =>
+    kind === "session" ? 5 * 3_600_000 : 7 * 24 * 3_600_000;
 
 /** "GrokBuild" as "Grok Build". */
 const spaced = (name: string) => name.replace(/([a-z])([A-Z])/g, "$1 $2");
@@ -408,7 +506,7 @@ function askCodex(signal: AbortSignal, children: Set<ChildProcess>): Promise<Rec
             finish(() =>
                 reject(
                     error.code === "ENOENT"
-                        ? new Said(
+                        ? missing(
                               "The Codex CLI is not installed on the server: install it, then run codex login.",
                           )
                         : error,
@@ -462,7 +560,7 @@ function askCodex(signal: AbortSignal, children: Set<ChildProcess>): Promise<Rec
                         result !== null && typeof result === "object"
                             ? resolve(result as Record<string, any>)
                             : reject(
-                                  new Said(
+                                  missing(
                                       "Codex could not read the limits: run codex login, then try again.",
                                   ),
                               ),
@@ -488,13 +586,88 @@ function askCodex(signal: AbortSignal, children: Set<ChildProcess>): Promise<Rec
     });
 }
 
+/**
+ * Ask the Muse Code CLI (`muse usage --json`) for the account's allowance: the usage window it last observed, and the
+ * week's. Muse reads and renews its own sign-in, so no token passes through here. It answers one JSON object and ends.
+ */
+function askMuse(signal: AbortSignal, children: Set<ChildProcess>): Promise<Record<string, any>> {
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) {
+            reject(signal.reason);
+
+            return;
+        }
+
+        // The home folder, as for Codex: the session's folder may be gone, and Muse keeps its sign-in there.
+        const child = spawn("muse", ["usage", "--json"], {
+            cwd: homedir(),
+            stdio: ["ignore", "pipe", "ignore"],
+        });
+        let out = "";
+        let done = false;
+
+        children.add(child);
+        child.once("close", () => children.delete(child));
+
+        const finish = (run: () => void) => {
+            if (done) {
+                return;
+            }
+
+            done = true;
+            signal.removeEventListener("abort", stop);
+            run();
+        };
+        // Nothing waits on a Muse that ignores the end of the read: it is stopped, and the read fails.
+        const stop = () =>
+            finish(() => {
+                child.kill("SIGKILL");
+                reject(signal.reason);
+            });
+
+        signal.addEventListener("abort", stop, { once: true });
+
+        child.stdout.on("error", () => {});
+        child.stdout.on("data", (chunk) => (out += String(chunk)));
+        child.on("error", (error: NodeJS.ErrnoException) =>
+            finish(() =>
+                reject(
+                    error.code === "ENOENT"
+                        ? missing("The Muse CLI is not installed on the server: install it, then run muse login.")
+                        : error,
+                ),
+            ),
+        );
+        child.on("close", () =>
+            finish(() => {
+                let data: unknown;
+
+                try {
+                    data = JSON.parse(out);
+                } catch {
+                    data = undefined;
+                }
+
+                if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+                    resolve(data as Record<string, any>);
+                } else {
+                    reject(
+                        missing("The Muse CLI did not answer with its usage: run muse login, then try again."),
+                    );
+                }
+            }),
+        );
+    });
+}
+
 export default function createSubscriptionUsage(_host: unknown, web: Web) {
     // Pi's own models and sign-ins: `getAuth` renews an expiring subscription token under Pi's lock, as Pi does.
     let runtime: Promise<ModelRuntime> | undefined;
     let last: { at: number; reports: Report[] } | undefined;
     let pending: Promise<{ at: number; reports: Report[] }> | undefined;
-    // Turning the module off, or a new version of it, stops the reads still running, and Codex with them: the module
-    // is gone once every Codex it started ended (one that ignores being asked to stop is killed after 2 s).
+    // Turning the module off, or a new version of it, stops the reads still running, and the commands they started with
+    // them: the module is gone once every one of those ended (a Codex that ignores being asked to stop is killed after
+    // 2 s, and a Muse at once).
     const alive = new AbortController();
     const children = new Set<ChildProcess>();
 
@@ -535,7 +708,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
         const found = await signIn(provider, signal);
 
         if (found === undefined) {
-            throw new Said("Pi is not signed in to it: sign in under Menu → Providers.");
+            throw missing("Pi is not signed in to it: sign in under Menu → Providers.");
         }
 
         return found.key;
@@ -571,6 +744,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                             ...resetOf(limit.resets_at),
                             level: levelOf(percent, limit.severity),
                             binding: limit.is_active === true,
+                            windowMs: claudeWindowMs(limit.kind),
                         };
                     });
             } else {
@@ -593,6 +767,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                             percent,
                             ...resetOf(window.resets_at),
                             level: levelOf(percent),
+                            windowMs: claudeWindowMs(field === "five_hour" ? "session" : "weekly_all"),
                         },
                     ];
                 });
@@ -610,12 +785,12 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 ],
             };
         } catch (error) {
-            return { id: "anthropic", name, ok: false, error: failed(error) };
+            return { id: "anthropic", name, ...failure(error) };
         }
     }
 
     async function chatGpt(signal: AbortSignal): Promise<Report> {
-        const name = "ChatGPT (OpenAI Codex)";
+        const name = "ChatGPT";
 
         try {
             const data = await askCodex(signal, children);
@@ -647,6 +822,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                         percent,
                         ...resetOf(window.resetsAt),
                         level: snapshot.rateLimitReachedType ? "critical" : levelOf(percent),
+                        ...windowOf(window.windowDurationMins),
                     });
                 }
             }
@@ -654,12 +830,6 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
             const plan = snapshots.find((each) => typeof each.planType === "string")?.planType;
             const resets = data.rateLimitResetCredits?.availableCount;
             const credits = snapshots.find((each) => each.credits?.hasCredits === true)?.credits;
-
-            notes.push(
-                typeof plan === "string"
-                    ? `${plan.charAt(0).toUpperCase()}${plan.slice(1)} plan, from the Codex CLI's sign-in.`
-                    : "From the Codex CLI's sign-in.",
-            );
 
             if (data.ordinaryUsageAllowed === false) {
                 notes.push("Codex says the plan's usage is used up for now.");
@@ -677,9 +847,9 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 notes.push(`${resets} free full reset${resets === 1 ? "" : "s"} available.`);
             }
 
-            return { id: "openai", name, ok: true, limits, notes };
+            return { id: "openai", name: chatGptName(plan), ok: true, limits, notes };
         } catch (error) {
-            return { id: "openai", name, ok: false, error: failed(error) };
+            return { id: "openai", name, ...failure(error) };
         }
     }
 
@@ -700,11 +870,11 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
 
             const usage = ((await response.json()) as { usage?: Record<string, any> }).usage ?? {};
             const limits = [
-                ["rolling", "5 hours, rolling"],
-                ["weekly", "Week"],
-                ["monthly", "Month"],
-            ].flatMap(([field, label]) => {
-                const window = usage[field!];
+                { field: "rolling", label: "5 hours", minutes: 300, rolling: true },
+                { field: "weekly", label: "Week", minutes: 10_080, rolling: false },
+                { field: "monthly", label: "Month", minutes: 43_200, rolling: false },
+            ].flatMap(({ field, label, minutes, rolling }) => {
+                const window = usage[field];
 
                 if (window === null || typeof window !== "object") {
                     return [];
@@ -715,17 +885,19 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 // Its own word for the state ("ok", or a word for over), else how full it is.
                 return [
                     {
-                        label: label!,
+                        label,
                         percent,
-                        ...resetOf(window.resetsAt),
+                        // A rolling window moves with every call, so it has no single time to name.
+                        ...(rolling ? {} : resetOf(window.resetsAt)),
                         level: levelOf(percent, window.status),
+                        windowMs: minutes * 60_000,
                     },
                 ];
             });
 
             return { id: "opencode-go", name, ok: true, limits, notes: [] };
         } catch (error) {
-            return { id: "opencode-go", name, ok: false, error: failed(error) };
+            return { id: "opencode-go", name, ...failure(error) };
         }
     }
 
@@ -734,7 +906,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
      * no plan to show (an xAI API key pays as it goes), so the page leaves Grok out.
      */
     async function grok(signal: AbortSignal): Promise<Report | undefined> {
-        const name = "Grok (xAI)";
+        const name = "Grok";
 
         try {
             const found = await signIn("xai", signal);
@@ -779,44 +951,31 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 const percent = percentOf(config.creditUsagePercent);
 
                 limits.push({
-                    label: `${windowLabel(Math.round((end - start) / 60_000))}, shared pool`,
+                    label: windowLabel(Math.round((end - start) / 60_000)),
                     percent,
                     ...resetOf(period.end),
                     level: levelOf(percent),
+                    windowMs: end - start,
                 });
             }
 
             const plan = await tier;
-
-            notes.push(
-                typeof plan === "string" && plan.trim() !== ""
-                    ? `${plan.trim()} plan, from Pi's xAI sign-in.`
-                    : "From Pi's xAI sign-in.",
-            );
-
-            const products = (Array.isArray(config.productUsage) ? config.productUsage : [])
-                .filter(
-                    (each: unknown): each is Record<string, any> =>
-                        each !== null &&
-                        typeof each === "object" &&
-                        typeof (each as any).product === "string",
-                )
-                .map(
-                    (each) =>
-                        `${spaced(each.product)} ${Math.round(percentOf(each.usagePercent))}%`,
-                );
-
-            if (products.length > 0) {
-                notes.push(`Of the pool: ${products.join(", ")}.`);
-            }
-
             const cap = percentOf(config.onDemandCap?.val);
 
-            notes.push(cap > 0 ? `Pay as you go: up to ${cap} credits.` : "Pay as you go is off.");
+            // Only a plan that bought pay-as-you-go credits needs to say so: off is the usual case.
+            if (cap > 0) {
+                notes.push(`Pay as you go: up to ${cap} credits.`);
+            }
 
-            return { id: "xai", name, ok: true, limits, notes };
+            return {
+                id: "xai",
+                name: typeof plan === "string" && plan.trim() !== "" ? plan.trim() : name,
+                ok: true,
+                limits,
+                notes,
+            };
         } catch (error) {
-            return { id: "xai", name, ok: false, error: failed(error) };
+            return { id: "xai", name, ...failure(error) };
         }
     }
 
@@ -890,6 +1049,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                         percent,
                         ...resetOfMs(entry.nextResetTime),
                         level: levelOf(percent),
+                        ...windowOf(zaiMinutes(entry.unit, entry.number)),
                     });
                 } else if (type === "TIME_LIMIT") {
                     // Web search, web reader, and Zread calls: a count, not tokens.
@@ -905,6 +1065,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                         percent,
                         ...resetOfMs(entry.nextResetTime),
                         level: levelOf(percent),
+                        ...windowOf(zaiMinutes(entry.unit, entry.number)),
                     });
                     notes.push(
                         `Web tools: web search, web reader, and Zread calls, for each ${window.toLowerCase()}.`,
@@ -928,7 +1089,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 ],
             };
         } catch (error) {
-            return { id: "zai", name, ok: false, error: failed(error) };
+            return { id: "zai", name, ...failure(error) };
         }
     }
 
@@ -1042,6 +1203,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                         percent,
                         ...resetOfMs(Number(window.end)),
                         level: levelOf(percent),
+                        windowMs: minutes * 60_000,
                     });
                 }
             }
@@ -1049,7 +1211,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
             // Text first: it is what the work runs on.
             return { id: "minimax", name, ok: true, limits: [...limits, ...others], notes };
         } catch (error) {
-            return { id: "minimax", name, ok: false, error: failed(error) };
+            return { id: "minimax", name, ...failure(error) };
         }
     }
 
@@ -1103,7 +1265,143 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 },
             };
         } catch (error) {
-            return { id: "deepseek", name, ok: false, error: failed(error) };
+            return { id: "deepseek", name, ...failure(error) };
+        }
+    }
+
+    async function ollama(signal: AbortSignal): Promise<Report | undefined> {
+        const name = "Ollama Cloud";
+
+        try {
+            // Pi's provider for an endpoint of one's own carries the name its owner chose: `ollama-cloud` is the cloud.
+            // A local server has no account, and its placeholder key is no sign-in, so the card stays out.
+            const found = (await signIn("ollama-cloud", signal)) ?? (await signIn("ollama", signal));
+
+            if (found === undefined || found.key === OLLAMA_LOCAL_KEY) {
+                return undefined;
+            }
+
+            const response = await fetch(OLLAMA_BALANCE, {
+                headers: { authorization: `Bearer ${found.key}` },
+                redirect: "error",
+                signal,
+            });
+
+            if (!response.ok) {
+                throw answered(response.status);
+            }
+
+            const data = (await response.json()) as Record<string, any>;
+            const included = data.included ?? {};
+            const allowance = amountOf(included.allowance_usd);
+            // What is left of the month's allowance, and what is left of the credits that were bought. Ollama spends
+            // the included credits first, then the purchased ones.
+            const granted = amountOf(included.balance_usd);
+            const toppedUp = amountOf(data.purchased?.balance_usd);
+            const limits: Limit[] = [];
+
+            // A paid plan includes credits each month, and its share used is the plan's limit. Pay as you go has none.
+            if (allowance > 0) {
+                const percent = Math.min(100, Math.max(0, ((allowance - granted) / allowance) * 100));
+                const from = Date.parse(included.period?.from ?? "");
+                const until = Date.parse(included.period?.until ?? "");
+
+                limits.push({
+                    label: "Month",
+                    percent,
+                    ...resetOf(included.period?.until),
+                    level: levelOf(percent),
+                    ...(Number.isFinite(from) && Number.isFinite(until) && until > from
+                        ? { windowMs: until - from }
+                        : {}),
+                });
+            }
+
+            const total = granted + toppedUp;
+
+            return {
+                id: "ollama",
+                name,
+                ok: true,
+                limits,
+                notes: [offPeakNote(Date.now())],
+                balance: {
+                    currency: "USD",
+                    total,
+                    granted,
+                    toppedUp,
+                    enough: total > 0,
+                },
+            };
+        } catch (error) {
+            return { id: "ollama", name, ...failure(error) };
+        }
+    }
+
+    async function muse(signal: AbortSignal): Promise<Report> {
+        const name = "Muse Code";
+
+        try {
+            const data = await askMuse(signal, children);
+            const found = data.allowance;
+            const allowance =
+                found !== null && typeof found === "object" && !Array.isArray(found)
+                    ? (found as Record<string, any>)
+                    : undefined;
+
+            // Before the first use in a window, Muse has observed nothing, and it says so rather than guessing.
+            if (allowance === undefined) {
+                return {
+                    id: "muse",
+                    name,
+                    ok: true,
+                    limits: [],
+                    notes: [
+                        "No usage observed yet: Muse reports it after the first use in a window.",
+                    ],
+                };
+            }
+
+            const window = percentOf(allowance.usedPercent);
+            const weekly = allowance.weekly;
+            const limits: Limit[] = [
+                {
+                    // Muse names the window's length when it knows it: its 5-hour block, unless it says otherwise.
+                    label:
+                        typeof allowance.windowDurationMins === "number"
+                            ? windowLabel(allowance.windowDurationMins)
+                            : "5 hours",
+                    percent: window,
+                    ...resetOfMs(allowance.resetsAtMs),
+                    level: levelOf(window),
+                    ...windowOf(
+                        typeof allowance.windowDurationMins === "number"
+                            ? allowance.windowDurationMins
+                            : 300,
+                    ),
+                },
+            ];
+
+            if (weekly !== null && typeof weekly === "object" && !Array.isArray(weekly)) {
+                const percent = percentOf((weekly as Record<string, any>).usedPercent);
+
+                limits.push({
+                    label: "Week",
+                    percent,
+                    ...resetOfMs(weekly.resetsAtMs),
+                    level: levelOf(percent),
+                    windowMs: 7 * 24 * 3_600_000,
+                });
+            }
+
+            const notes =
+                typeof allowance.tier === "string" && allowance.tier !== ""
+                    ? [`${capitalized(spaced(allowance.tier))} plan.`]
+                    : [];
+
+            return { id: "muse", name, ok: true, limits, notes };
+        } catch (error) {
+            return { id: "muse", name, ...failure(error) };
         }
     }
 
@@ -1119,6 +1417,8 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 zai(signal),
                 miniMax(signal),
                 deepSeek(signal),
+                ollama(signal),
+                muse(signal),
             ])
         )
             .filter((report): report is Report => report !== undefined)
