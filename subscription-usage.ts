@@ -38,7 +38,7 @@ interface Balance {
 
 type Report =
     | { id: string; name: string; ok: true; limits: Limit[]; notes: string[]; balance?: Balance }
-    | { id: string; name: string; ok: false; error: string };
+    | { id: string; name: string; ok: false; error: string; missing?: boolean };
 
 type OkReport = Extract<Report, { ok: true }>;
 
@@ -134,7 +134,9 @@ function money(amount: number, currency: string): string {
  * margin tells what color tells on the page: `!` for a warning, `!!` for critical, `▸` the limit in force.
  */
 export function usageCard(data: { at: number; reports: Report[] }, now = Date.now()): string {
-    const rows = data.reports.flatMap((report) => (report.ok ? report.limits : []));
+    // A service that this machine has no account for is no news in a card that others read: the page still says so.
+    const shown = data.reports.filter((report) => report.ok || !report.missing);
+    const rows = shown.flatMap((report) => (report.ok ? report.limits : []));
     const label = Math.min(16, Math.max(8, ...rows.map((each) => shortLabel(each.label).length)));
     const resets = rows.map((each) => Date.parse(each.resetsAt ?? ""));
     const reset = Math.max(
@@ -150,7 +152,7 @@ export function usageCard(data: { at: number; reports: Report[] }, now = Date.no
     const rule = (name: string, tag = "") =>
         `${name} ${"─".repeat(Math.max(3, width - name.length - (tag ? tag.length + 2 : 1)))}${tag ? ` ${tag}` : ""}`;
 
-    for (const report of data.reports) {
+    for (const report of shown) {
         if (!report.ok) {
             lines.push(rule(report.name, "unavailable"), `   ${report.error}`);
 
@@ -208,7 +210,7 @@ export function usageCard(data: { at: number; reports: Report[] }, now = Date.no
         }
     }
 
-    if (data.reports.length === 0) {
+    if (shown.length === 0) {
         lines.push("No plans reported: sign in under Menu → Providers.");
     }
 
@@ -239,7 +241,18 @@ export function usageCard(data: { at: number; reports: Report[] }, now = Date.no
 }
 
 /** Words this module wrote itself, safe to show. Anything else that goes wrong is told in fixed words. */
-class Said extends Error {}
+class Said extends Error {
+    /** This machine has no account for the service, so a card that others read leaves the service out. */
+    readonly missing: boolean;
+
+    constructor(message: string, missing = false) {
+        super(message);
+        this.missing = missing;
+    }
+}
+
+/** A failure that means no account for the service is on this machine: no sign-in, no key, or no command. */
+const missing = (message: string) => new Said(message, true);
 
 /** A percent from a service: a finite number, else 0. */
 function percentOf(value: unknown): number {
@@ -330,9 +343,14 @@ function resetOf(value: unknown): { resetsAt?: string } {
         : {};
 }
 
-/** A report that failed: what its line in the card says, in the words that `failed` chose. */
-function failure(error: unknown): { ok: false; error: string } {
-    return { ok: false, error: failed(error) };
+/** A report that failed: what its line in the card says, in the words that `failed` chose, and whether a card must
+ * leave it out. */
+function failure(error: unknown): { ok: false; error: string; missing?: boolean } {
+    return {
+        ok: false,
+        error: failed(error),
+        ...(error instanceof Said && error.missing ? { missing: true } : {}),
+    };
 }
 
 /** A service's failure in words for its card, which names the service: never what the service sent back. */
@@ -461,7 +479,7 @@ function askCodex(signal: AbortSignal, children: Set<ChildProcess>): Promise<Rec
             finish(() =>
                 reject(
                     error.code === "ENOENT"
-                        ? new Said(
+                        ? missing(
                               "The Codex CLI is not installed on the server: install it, then run codex login.",
                           )
                         : error,
@@ -515,7 +533,7 @@ function askCodex(signal: AbortSignal, children: Set<ChildProcess>): Promise<Rec
                         result !== null && typeof result === "object"
                             ? resolve(result as Record<string, any>)
                             : reject(
-                                  new Said(
+                                  missing(
                                       "Codex could not read the limits: run codex login, then try again.",
                                   ),
                               ),
@@ -588,7 +606,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
         const found = await signIn(provider, signal);
 
         if (found === undefined) {
-            throw new Said("Pi is not signed in to it: sign in under Menu → Providers.");
+            throw missing("Pi is not signed in to it: sign in under Menu → Providers.");
         }
 
         return found.key;
