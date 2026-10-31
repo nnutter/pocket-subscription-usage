@@ -330,6 +330,11 @@ function resetOf(value: unknown): { resetsAt?: string } {
         : {};
 }
 
+/** A report that failed: what its line in the card says, in the words that `failed` chose. */
+function failure(error: unknown): { ok: false; error: string } {
+    return { ok: false, error: failed(error) };
+}
+
 /** A service's failure in words for its card, which names the service: never what the service sent back. */
 function failed(error: unknown): string {
     if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
@@ -658,7 +663,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 ],
             };
         } catch (error) {
-            return { id: "anthropic", name, ok: false, error: failed(error) };
+            return { id: "anthropic", name, ...failure(error) };
         }
     }
 
@@ -727,7 +732,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
 
             return { id: "openai", name, ok: true, limits, notes };
         } catch (error) {
-            return { id: "openai", name, ok: false, error: failed(error) };
+            return { id: "openai", name, ...failure(error) };
         }
     }
 
@@ -773,7 +778,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
 
             return { id: "opencode-go", name, ok: true, limits, notes: [] };
         } catch (error) {
-            return { id: "opencode-go", name, ok: false, error: failed(error) };
+            return { id: "opencode-go", name, ...failure(error) };
         }
     }
 
@@ -864,7 +869,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
 
             return { id: "xai", name, ok: true, limits, notes };
         } catch (error) {
-            return { id: "xai", name, ok: false, error: failed(error) };
+            return { id: "xai", name, ...failure(error) };
         }
     }
 
@@ -976,7 +981,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 ],
             };
         } catch (error) {
-            return { id: "zai", name, ok: false, error: failed(error) };
+            return { id: "zai", name, ...failure(error) };
         }
     }
 
@@ -1097,7 +1102,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
             // Text first: it is what the work runs on.
             return { id: "minimax", name, ok: true, limits: [...limits, ...others], notes };
         } catch (error) {
-            return { id: "minimax", name, ok: false, error: failed(error) };
+            return { id: "minimax", name, ...failure(error) };
         }
     }
 
@@ -1151,7 +1156,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 },
             };
         } catch (error) {
-            return { id: "deepseek", name, ok: false, error: failed(error) };
+            return { id: "deepseek", name, ...failure(error) };
         }
     }
 
@@ -1215,7 +1220,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 },
             };
         } catch (error) {
-            return { id: "ollama", name, ok: false, error: failed(error) };
+            return { id: "ollama", name, ...failure(error) };
         }
     }
 
