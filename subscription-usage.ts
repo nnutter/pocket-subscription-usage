@@ -1,8 +1,8 @@
 /**
- * Subscription usage: a page on the rail with how much of your Claude, ChatGPT (Codex), OpenCode Go, Grok, Z.ai, and
- * MiniMax plans is used, and when each limit resets, plus the DeepSeek and Ollama Cloud balances when Pi has a key for
- * them. The server asks each service with the sign-ins already on this machine, so no key or token reaches the browser.
- * The command `/usage-plans` posts the same usage as a card in the session.
+ * Subscription usage: a page on the rail with how much of your Claude, ChatGPT (Codex), OpenCode Go, Grok, Z.ai,
+ * MiniMax, and Muse Code plans is used, and when each limit resets, plus the DeepSeek and Ollama Cloud balances when Pi
+ * has a key for them. The server asks each service with the sign-ins already on this machine, so no key or token
+ * reaches the browser. The command `/usage-plans` posts the same usage as a card in the session.
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { homedir } from "node:os";
@@ -57,6 +57,7 @@ const PROVIDER_REPORTS: Record<string, { report: string; label: string }> = {
     deepseek: { report: "deepseek", label: "DeepSeek" },
     "ollama-cloud": { report: "ollama", label: "Ollama" },
     ollama: { report: "ollama", label: "Ollama" },
+    meta: { report: "muse", label: "Muse" },
 };
 
 /** How long each service may take to answer. */
@@ -559,13 +560,88 @@ function askCodex(signal: AbortSignal, children: Set<ChildProcess>): Promise<Rec
     });
 }
 
+/**
+ * Ask the Muse Code CLI (`muse usage --json`) for the account's allowance: the usage window it last observed, and the
+ * week's. Muse reads and renews its own sign-in, so no token passes through here. It answers one JSON object and ends.
+ */
+function askMuse(signal: AbortSignal, children: Set<ChildProcess>): Promise<Record<string, any>> {
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) {
+            reject(signal.reason);
+
+            return;
+        }
+
+        // The home folder, as for Codex: the session's folder may be gone, and Muse keeps its sign-in there.
+        const child = spawn("muse", ["usage", "--json"], {
+            cwd: homedir(),
+            stdio: ["ignore", "pipe", "ignore"],
+        });
+        let out = "";
+        let done = false;
+
+        children.add(child);
+        child.once("close", () => children.delete(child));
+
+        const finish = (run: () => void) => {
+            if (done) {
+                return;
+            }
+
+            done = true;
+            signal.removeEventListener("abort", stop);
+            run();
+        };
+        // Nothing waits on a Muse that ignores the end of the read: it is stopped, and the read fails.
+        const stop = () =>
+            finish(() => {
+                child.kill("SIGKILL");
+                reject(signal.reason);
+            });
+
+        signal.addEventListener("abort", stop, { once: true });
+
+        child.stdout.on("error", () => {});
+        child.stdout.on("data", (chunk) => (out += String(chunk)));
+        child.on("error", (error: NodeJS.ErrnoException) =>
+            finish(() =>
+                reject(
+                    error.code === "ENOENT"
+                        ? missing("The Muse CLI is not installed on the server: install it, then run muse login.")
+                        : error,
+                ),
+            ),
+        );
+        child.on("close", () =>
+            finish(() => {
+                let data: unknown;
+
+                try {
+                    data = JSON.parse(out);
+                } catch {
+                    data = undefined;
+                }
+
+                if (data !== null && typeof data === "object" && !Array.isArray(data)) {
+                    resolve(data as Record<string, any>);
+                } else {
+                    reject(
+                        missing("The Muse CLI did not answer with its usage: run muse login, then try again."),
+                    );
+                }
+            }),
+        );
+    });
+}
+
 export default function createSubscriptionUsage(_host: unknown, web: Web) {
     // Pi's own models and sign-ins: `getAuth` renews an expiring subscription token under Pi's lock, as Pi does.
     let runtime: Promise<ModelRuntime> | undefined;
     let last: { at: number; reports: Report[] } | undefined;
     let pending: Promise<{ at: number; reports: Report[] }> | undefined;
-    // Turning the module off, or a new version of it, stops the reads still running, and Codex with them: the module
-    // is gone once every Codex it started ended (one that ignores being asked to stop is killed after 2 s).
+    // Turning the module off, or a new version of it, stops the reads still running, and the commands they started with
+    // them: the module is gone once every one of those ended (a Codex that ignores being asked to stop is killed after
+    // 2 s, and a Muse at once).
     const alive = new AbortController();
     const children = new Set<ChildProcess>();
 
@@ -1242,6 +1318,67 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
         }
     }
 
+    async function muse(signal: AbortSignal): Promise<Report> {
+        const name = "Muse Code";
+
+        try {
+            const data = await askMuse(signal, children);
+            const found = data.allowance;
+            const allowance =
+                found !== null && typeof found === "object" && !Array.isArray(found)
+                    ? (found as Record<string, any>)
+                    : undefined;
+
+            // Before the first use in a window, Muse has observed nothing, and it says so rather than guessing.
+            if (allowance === undefined) {
+                return {
+                    id: "muse",
+                    name,
+                    ok: true,
+                    limits: [],
+                    notes: [
+                        "No usage observed yet: Muse reports it after the first use in a window.",
+                    ],
+                };
+            }
+
+            const window = percentOf(allowance.usedPercent);
+            const weekly = allowance.weekly;
+            const limits: Limit[] = [
+                {
+                    // Muse names the window's length when it knows it: its 5-hour block, unless it says otherwise.
+                    label:
+                        typeof allowance.windowDurationMins === "number"
+                            ? windowLabel(allowance.windowDurationMins)
+                            : "5 hours",
+                    percent: window,
+                    ...resetOfMs(allowance.resetsAtMs),
+                    level: levelOf(window),
+                },
+            ];
+
+            if (weekly !== null && typeof weekly === "object" && !Array.isArray(weekly)) {
+                const percent = percentOf((weekly as Record<string, any>).usedPercent);
+
+                limits.push({
+                    label: "Week",
+                    percent,
+                    ...resetOfMs(weekly.resetsAtMs),
+                    level: levelOf(percent),
+                });
+            }
+
+            const notes =
+                typeof allowance.tier === "string" && allowance.tier !== ""
+                    ? [`${capitalized(spaced(allowance.tier))} plan.`]
+                    : [];
+
+            return { id: "muse", name, ok: true, limits, notes };
+        } catch (error) {
+            return { id: "muse", name, ...failure(error) };
+        }
+    }
+
     /** Every service at once, each on its own: one that fails leaves the others' answers. */
     const read = async () => {
         const signal = AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), alive.signal]);
@@ -1255,6 +1392,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 miniMax(signal),
                 deepSeek(signal),
                 ollama(signal),
+                muse(signal),
             ])
         )
             .filter((report): report is Report => report !== undefined)

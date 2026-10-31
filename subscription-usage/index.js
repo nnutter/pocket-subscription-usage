@@ -561,6 +561,8 @@ export default function setup(pocket) {
             "minimax",
             "deepseek",
             "ollama",
+            "muse",
+            "meta",
             "balance",
             "credit",
             "quota",
