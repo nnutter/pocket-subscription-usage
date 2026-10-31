@@ -1,8 +1,8 @@
 /**
  * Subscription usage: a page on the rail with how much of your Claude, ChatGPT (Codex), OpenCode Go, Grok, Z.ai, and
- * MiniMax plans is used, and when each limit resets, plus the DeepSeek balance when Pi has a DeepSeek key. The server
- * asks each service with the sign-ins already on this machine, so no key or token reaches the browser. The command
- * `/usage-plans` posts the same usage as a card in the session.
+ * MiniMax plans is used, and when each limit resets, plus the DeepSeek and Ollama Cloud balances when Pi has a key for
+ * them. The server asks each service with the sign-ins already on this machine, so no key or token reaches the browser.
+ * The command `/usage-plans` posts the same usage as a card in the session.
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { homedir } from "node:os";
@@ -55,6 +55,8 @@ const PROVIDER_REPORTS: Record<string, { report: string; label: string }> = {
     zai: { report: "zai", label: "Z.ai" },
     minimax: { report: "minimax", label: "MiniMax" },
     deepseek: { report: "deepseek", label: "DeepSeek" },
+    "ollama-cloud": { report: "ollama", label: "Ollama" },
+    ollama: { report: "ollama", label: "Ollama" },
 };
 
 /** How long each service may take to answer. */
@@ -74,6 +76,10 @@ const ZAI_QUOTA = "https://api.z.ai/api/monitor/usage/quota/limit";
 const ZAI_PLANS = "https://api.z.ai/api/biz/subscription/list";
 /** MiniMax's Coding Plan lanes, as its own Coding Plan page reads them. */
 const MINIMAX_REMAINS = "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
+/** Ollama Cloud's credits: the included allowance, the credits purchased, and the month that the allowance covers. */
+const OLLAMA_BALANCE = "https://ollama.com/api/balance";
+/** The key that a local Ollama endpoint usually gets: Ollama ignores it, and no account stands behind it. */
+const OLLAMA_LOCAL_KEY = "ollama";
 /** Z.ai's units for a window's length, in minutes (5 is a month, named on its own). */
 const ZAI_UNIT_MINUTES: Record<number, number> = { 3: 60, 4: 1440, 6: 10_080 };
 
@@ -1107,6 +1113,70 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
         }
     }
 
+    async function ollama(signal: AbortSignal): Promise<Report | undefined> {
+        const name = "Ollama Cloud";
+
+        try {
+            // Pi's provider for an endpoint of one's own carries the name its owner chose: `ollama-cloud` is the cloud.
+            // A local server has no account, and its placeholder key is no sign-in, so the card stays out.
+            const found = (await signIn("ollama-cloud", signal)) ?? (await signIn("ollama", signal));
+
+            if (found === undefined || found.key === OLLAMA_LOCAL_KEY) {
+                return undefined;
+            }
+
+            const response = await fetch(OLLAMA_BALANCE, {
+                headers: { authorization: `Bearer ${found.key}` },
+                redirect: "error",
+                signal,
+            });
+
+            if (!response.ok) {
+                throw answered(response.status);
+            }
+
+            const data = (await response.json()) as Record<string, any>;
+            const included = data.included ?? {};
+            const allowance = amountOf(included.allowance_usd);
+            // What is left of the month's allowance, and what is left of the credits that were bought. Ollama spends
+            // the included credits first, then the purchased ones.
+            const granted = amountOf(included.balance_usd);
+            const toppedUp = amountOf(data.purchased?.balance_usd);
+            const limits: Limit[] = [];
+
+            // A paid plan includes credits each month, and its share used is the plan's limit. Pay as you go has none.
+            if (allowance > 0) {
+                const percent = Math.min(100, Math.max(0, ((allowance - granted) / allowance) * 100));
+
+                limits.push({
+                    label: "Month, included",
+                    percent,
+                    ...resetOf(included.period?.until),
+                    level: levelOf(percent),
+                });
+            }
+
+            const total = granted + toppedUp;
+
+            return {
+                id: "ollama",
+                name,
+                ok: true,
+                limits,
+                notes: [],
+                balance: {
+                    currency: "USD",
+                    total,
+                    granted,
+                    toppedUp,
+                    enough: total > 0,
+                },
+            };
+        } catch (error) {
+            return { id: "ollama", name, ok: false, error: failed(error) };
+        }
+    }
+
     /** Every service at once, each on its own: one that fails leaves the others' answers. */
     const read = async () => {
         const signal = AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), alive.signal]);
@@ -1119,6 +1189,7 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
                 zai(signal),
                 miniMax(signal),
                 deepSeek(signal),
+                ollama(signal),
             ])
         )
             .filter((report): report is Report => report !== undefined)

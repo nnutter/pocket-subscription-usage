@@ -1,7 +1,8 @@
 // Subscription usage's browser module: a rail button (with the fullest limit on it once one passes 80%), a launcher
 // action, a page set like the home screen's fastfetch: a "usage@pi-pocket" card, then each plan's limits as rows of
 // small squares (the home screen's color swatches) with how full each is and when it resets, and a prepaid account's
-// balance (DeepSeek) as money left. It also adds a status line item with the quota of the current model's provider.
+// balance (DeepSeek, Ollama Cloud) as money left. It also adds a status line item with the quota of the current model's
+// provider.
 // The server module asks the services; this only shows what it says.
 
 export const pocketApi = 1;
@@ -544,7 +545,7 @@ export default function setup(pocket) {
     pocket.launcher({
         id: "usage",
         label: "Subscription usage",
-        detail: "Plan limits and the DeepSeek balance",
+        detail: "Plan limits and prepaid balances",
         iconPath: BARS,
         keywords: [
             "anthropic",
@@ -559,6 +560,7 @@ export default function setup(pocket) {
             "glm",
             "minimax",
             "deepseek",
+            "ollama",
             "balance",
             "credit",
             "quota",

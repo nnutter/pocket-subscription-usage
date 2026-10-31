@@ -1,6 +1,6 @@
 # Subscription usage
 
-A drop-in extension for [Pi Pocket](https://github.com/TannerMidd/pi-pocket). It adds a page to the rail. The page shows how much of your Claude, ChatGPT (Codex), OpenCode Go, Grok, Z.ai, and MiniMax plans you used, and when each limit resets. When Pi has a DeepSeek key, it also shows the DeepSeek balance, in money left rather than a percentage.
+A drop-in extension for [Pi Pocket](https://github.com/TannerMidd/pi-pocket). It adds a page to the rail. The page shows how much of your Claude, ChatGPT (Codex), OpenCode Go, Grok, Z.ai, and MiniMax plans you used, and when each limit resets. When Pi has a DeepSeek key, it also shows the DeepSeek balance, in money left rather than a percentage. With an Ollama Cloud key, it shows that plan's included credits, the money left in them, and the credits bought on top.
 
 ## Install
 
@@ -21,8 +21,9 @@ You can also copy these files into the extensions folder of Pi Pocket (`~/.pi-po
     - Z.ai: with Pi's Z.ai key, for a GLM Coding Plan. It reads the 5-hour (and, on bigger plans, weekly) token windows and the monthly count of web search, web reader, and Zread calls. Without a Z.ai key, the page leaves Z.ai out.
     - MiniMax: with Pi's MiniMax key, for a Coding Plan (`sk-cp-` keys). It reads text and each other lane (video, say), in its short window and its week. A standard key (`sk-api-`) pays as it goes and has no plan, so the page leaves MiniMax out, as it does without a key.
     - DeepSeek: with the API key that Pi has, it asks [`GET /user/balance`](https://api-docs.deepseek.com/api/get-user-balance) for the money left, whether the key can take calls, and what makes up the balance (granted and topped up). Its card shows only when Pi has a DeepSeek key, so an account that does not use DeepSeek sees no card.
-- **In the browser:** it adds a page and a rail button, for the owner only. The page shows the usage, and the DeepSeek balance. No key or token goes to the browser.
-- **In the status line:** one item shows the quota of the current model's provider: what is left of the limit in force (or the tightest), and when it resets; for DeepSeek, the money left. Its tooltip lists every limit, and a warning or critical level colors it. It follows model changes and otherwise refreshes at most every 5 minutes, shows nothing when that plan has no report, and can be hidden in Appearance → Layout.
+    - Ollama Cloud: with Pi's key for the provider that points at Ollama Cloud (`ollama-cloud` in `models.json`), it asks [`GET /api/balance`](https://docs.ollama.com/api/balance) for the month's included credits and the credits bought on top. The card shows a gauge of the included credits that the month used, with its reset, and the money left. Ollama spends the included credits first, then the bought ones. An account with no key, or with the placeholder key of a local Ollama server, sees no card.
+- **In the browser:** it adds a page and a rail button, for the owner only. The page shows the usage, and the DeepSeek and Ollama Cloud balances. No key or token goes to the browser.
+- **In the status line:** one item shows the quota of the current model's provider: what is left of the limit in force (or the tightest), and when it resets; for DeepSeek and Ollama Cloud, the money left. Its tooltip lists every limit, and a warning or critical level colors it. It follows model changes and otherwise refreshes at most every 5 minutes, shows nothing when that plan has no report, and can be hidden in Appearance → Layout.
 - **In chat:** it adds the command `/usage-plans`, for the owner only. Type it in any session's message box to post the same usage as a card in that session: each plan, each limit with a gauge, how full it is, and how long until it resets. The card is plain text, sized for a phone. Everyone in the session can read it, and Pi never gets it.
 
 ```
