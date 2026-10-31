@@ -408,19 +408,26 @@ function windowLabel(minutes: unknown): string {
     return minutes % 60 === 0 ? `${minutes / 60} hours` : `${minutes} minutes`;
 }
 
-/** A Z.ai window as people read it: unit 3 is hours, 4 days, 5 months, 6 weeks. None for a unit it does not know. */
-function zaiWindow(unit: unknown, number: unknown): string | undefined {
+/** A Z.ai window's length in minutes: unit 3 is hours, 4 days, 5 months, 6 weeks. None for a unit it does not know. */
+function zaiMinutes(unit: unknown, number: unknown): number | undefined {
     if (typeof unit !== "number" || typeof number !== "number" || !(number > 0)) {
         return undefined;
     }
 
-    if (unit === 5) {
+    const minutes = unit === 5 ? 43_200 : ZAI_UNIT_MINUTES[unit];
+
+    return minutes === undefined ? undefined : minutes * number;
+}
+
+/** A Z.ai window as people read it: unit 3 is hours, 4 days, 5 months, 6 weeks. None for a unit it does not know. */
+function zaiWindow(unit: unknown, number: unknown): string | undefined {
+    if (unit === 5 && typeof number === "number" && number > 0) {
         return number === 1 ? "Month" : `${number} months`;
     }
 
-    const minutes = ZAI_UNIT_MINUTES[unit];
+    const minutes = zaiMinutes(unit, number);
 
-    return minutes === undefined ? undefined : windowLabel(minutes * number);
+    return minutes === undefined ? undefined : windowLabel(minutes);
 }
 
 /** "GrokBuild" as "Grok Build". */
