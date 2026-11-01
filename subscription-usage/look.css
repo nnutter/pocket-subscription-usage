@@ -153,6 +153,16 @@
     background: var(--muted);
 }
 
+/* A limit that is behind its window: its line takes the warning's color, in two steps, so the page shows which plans
+ * are close to leaving quota unused. */
+.su-pace.su-warn > i {
+    background: var(--warn);
+}
+
+.su-pace.su-far > i {
+    background: var(--err);
+}
+
 /* When it resets: small and quiet, so the gauge and its percent come first. */
 .su-when {
     grid-area: when;

@@ -24,8 +24,10 @@ const BADGE_EVERY_MS = 5 * 60_000;
 const QUOTA_EVERY_MS = 30_000;
 /** A reset further away than this shows its date, not only its weekday. */
 const NEAR_MS = 6 * 86_400_000;
-/** How many points under its window a plan may be before the rail counts it as behind: 5% of the window. */
+/** The points a limit must be behind its window by before its line turns yellow, and a plan before the rail counts it. */
 const LAG_POINTS = 5;
+/** The points a limit must be behind its window by before its line turns red. */
+const LAG_FAR_POINTS = 15;
 /** How far a window must run before a lag says anything: a window that just started lags in every plan. */
 const LAG_AFTER = 50;
 /** The squares in a gauge: each is 5% of a limit. */
@@ -302,14 +304,26 @@ export default function setup(pocket) {
 
     /**
      * A plan's limit: its name, a gauge of squares, how full it is, and when it resets, in a word on the right. Under
-     * the gauge, a line says how much of the window has passed, so a gauge that runs past it is outpacing the window.
+     * the gauge, a line says how much of the window has passed, so a gauge that runs past it is outpacing the window; it
+     * turns yellow and then red as use falls further behind the window, where quota may go unused.
      */
     function LimitRow({ limit, label = limit.label }) {
         const reset = Date.parse(limit.resetsAt ?? "");
         const percent = Number(limit.percent) || 0;
         const on = lit(percent);
         const timed = Number.isFinite(reset);
-        const share = windowShare(limit);
+        const lag = lagOf(limit);
+        const gap = lag === null ? 0 : Math.round(lag.points);
+        const behind = gap >= LAG_POINTS;
+        const far = gap >= LAG_FAR_POINTS;
+        const spoken =
+            lag === null
+                ? " used"
+                : ` used, ${lag.share}% into the window${behind ? `, ${gap} points behind` : ""}`;
+        const paceTitle =
+            lag === null
+                ? ""
+                : `${lag.share}% of the window has passed${behind ? `: use is ${gap} points behind` : ""}`;
 
         return html`<li class=${`su-limit su-${limit.level}`}>
             <span class="su-label">${label}</span>
@@ -325,12 +339,12 @@ export default function setup(pocket) {
                     )}
                 </span>
                 ${
-                    share !== null &&
+                    lag !== null &&
                     html`<span
-                        class="su-pace"
-                        style=${`--at:${share}%`}
+                        class=${`su-pace${far ? " su-far" : behind ? " su-warn" : ""}`}
+                        style=${`--at:${lag.share}%`}
                         aria-hidden="true"
-                        title=${`${share}% of the window has passed`}
+                        title=${paceTitle}
                         ><i></i
                     ></span>`
                 }
@@ -354,9 +368,7 @@ export default function setup(pocket) {
             </span>
             <span class="su-value"
                 >${Math.round(percent)}<span class="su-unit">%</span
-                ><span class="su-sr"
-                    >${share === null ? " used" : ` used, ${share}% into the window`}</span
-                ></span
+                ><span class="su-sr">${spoken}</span></span
             >
         </li>`;
     }
