@@ -1,8 +1,8 @@
-// Subscription usage's browser module: a rail button (with the fullest limit on it once one passes 80%), a launcher
-// action, a page (and a panel) with each plan's limits as rows of small squares (the home screen's color swatches) with
-// how full each is and when it resets, and a prepaid account's balance (DeepSeek, Ollama Cloud) as money left. The plans
-// that are fullest against their window's clock come first, and a footer says how old the reading is. It also adds a
-// status line item with the quota of the current model's provider.
+// Subscription usage's browser module: a rail button (with the number of plans whose quota may go unused on it, those
+// behind their window), a launcher action, a page (and a panel) with each plan's limits as rows of small squares (the
+// home screen's color swatches) with how full each is and when it resets, and a prepaid account's balance (DeepSeek,
+// Ollama Cloud) as money left. The plans that are fullest against their window's clock come first, and a footer says how
+// old the reading is. It also adds a status line item with the quota of the current model's provider.
 // The server module asks the services; this only shows what it says.
 
 export const pocketApi = 1;
@@ -24,6 +24,10 @@ const BADGE_EVERY_MS = 5 * 60_000;
 const QUOTA_EVERY_MS = 30_000;
 /** A reset further away than this shows its date, not only its weekday. */
 const NEAR_MS = 6 * 86_400_000;
+/** How many points under its window a plan may be before the rail counts it as behind: 5% of the window. */
+const LAG_POINTS = 5;
+/** How far a window must run before a lag says anything: a window that just started lags in every plan. */
+const LAG_AFTER = 50;
 /** The squares in a gauge: each is 5% of a limit. */
 const CELLS = 20;
 /** What "In force" on a limit means. */
@@ -54,15 +58,6 @@ const when = (time) =>
         time - Date.now() > NEAR_MS
             ? { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }
             : { weekday: "short", hour: "numeric", minute: "2-digit" },
-    );
-
-/** The fullest limit across the plans that answered, in percent. */
-const fullest = (data) =>
-    Math.max(
-        0,
-        ...(data?.reports ?? []).flatMap((report) =>
-            report.ok ? report.limits.map((each) => Number(each.percent) || 0) : [],
-        ),
     );
 
 /** How many of a gauge's squares are lit: at least one for any use, and not all of them until a limit is full. */
@@ -272,6 +267,24 @@ function rank(report) {
     const limit = longest(report.limits);
 
     return limit === undefined ? [1, 0] : [0, Number(limit.percent) || 0];
+}
+
+/**
+ * Whether a plan is behind its window, where its quota may go unused: its longest limit, once that window is past
+ * `LAG_AFTER` percent over, is `LAG_POINTS` or more under the share of the window that has passed. A plan with no window
+ * clock has nothing to be behind, and one that failed is not judged.
+ */
+function lagging(report) {
+    if (!report.ok) {
+        return false;
+    }
+
+    const limit = longest(report.limits);
+    const share = limit === undefined ? null : windowShare(limit);
+
+    return (
+        share !== null && share >= LAG_AFTER && (Number(limit.percent) || 0) <= share - LAG_POINTS
+    );
 }
 
 export default function setup(pocket) {
@@ -543,11 +556,11 @@ export default function setup(pocket) {
         page: "usage",
     });
 
-    /** The rail's button shows the fullest limit once one passes 80%. */
+    /** The rail's button counts the plans that are behind their window, where their quota may go unused. */
     function badge(data) {
-        const top = Math.round(fullest(data));
+        const behind = (data?.reports ?? []).filter(lagging).length;
 
-        rail.update({ badge: top >= 80 ? top : null });
+        rail.update({ badge: behind > 0 ? behind : null });
     }
 
     pocket.page({ id: "usage", title: "Quotas", component: Usage });
