@@ -25,23 +25,8 @@ You can also copy these files into the extensions folder of Pi Pocket (`~/.pi-po
     - Muse Code: with the Muse CLI, which reads and renews its own sign-in (install it, then run `muse login`). It runs `muse usage --json` and reads the subscription allowance: the current 5-hour window and the rolling week, each with the percent used and when it resets. Muse reports nothing before the first use in a window, and the card says so rather than guessing. With no CLI, or with no sign-in to it, the page says so and the card leaves Muse out.
 - **In the browser:** it adds a page and a rail button, for the owner only. The page shows the usage, and the DeepSeek and Ollama Cloud balances. In Pi Pocket 0.19 or newer it adds the same page as a panel too, which docks beside the conversation: a tap on the status line's quota opens it. No key or token goes to the browser.
 - **In the status line:** one item shows the quota of the current model's provider: what is left of the limit in force (or the tightest), and when it resets; for DeepSeek and Ollama Cloud, the money left. Its tooltip lists the same limits, and a warning or critical level colors it. It follows model changes and otherwise refreshes at most every 5 minutes, shows nothing when that plan has no report, and can be hidden in Appearance → Layout.
-- **In chat:** it adds the command `/usage-plans`, for the owner only. Type it in any session's message box to post the same usage as a card in that session: each plan, each limit with a gauge, how full it is, and how long until it resets. The card is plain text, sized for a phone. Everyone in the session can read it, and Pi never gets it. A service that this machine has no account for (no sign-in, no key, or no command) is left out, so the card shows only the plans that answered, while the page still says which one is missing and why.
 
-```
-Claude (Anthropic) ───────────────────
-   5h session  ■■■□□□□□□□  27%     49m
-▸  Week, all   ■■■□□□□□□□  32%  4d 18h
-   Week, Fable □□□□□□□□□□   0%  4d 18h
-OpenCode Go ──────────────────────────
-   5h, rolling ■□□□□□□□□□   2%  3h 32m
-   Week        ■■□□□□□□□□  17%      1d
-──────────────────────────────────────
-▸ in force · read Oct 24, 6:51 PM CDT
-```
-
-In the margin, `▸` marks the limit in force, `!` a warning, and `!!` a critical level. A Pi Pocket command needs a `-` in its name, so it is `/usage-plans`, not `/usage`; typing `/usage` suggests it.
-
-It runs no tools and changes nothing in your sessions, other than the cards that you post.
+It runs no tools and changes nothing in your sessions.
 
 ## License
 

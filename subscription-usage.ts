@@ -2,7 +2,7 @@
  * Subscription usage: a page on the rail with how much of your Claude, ChatGPT (Codex), OpenCode Go, Grok, Z.ai,
  * MiniMax, and Muse Code plans is used, and when each limit resets, plus the DeepSeek and Ollama Cloud balances when Pi
  * has a key for them. The server asks each service with the sign-ins already on this machine, so no key or token
- * reaches the browser. The command `/usage-plans` posts the same usage as a card in the session.
+ * reaches the browser.
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { homedir } from "node:os";
@@ -86,166 +86,9 @@ const OLLAMA_LOCAL_KEY = "ollama";
 /** Z.ai's units for a window's length, in minutes (5 is a month, named on its own). */
 const ZAI_UNIT_MINUTES: Record<number, number> = { 3: 60, 4: 1440, 6: 10_080 };
 
-/** A command card's width, in characters: it fits a phone's chat column without a wrap. */
-const CARD_WIDTH = 38;
-
-/** A limit's name for the card's narrow column: "5-hour session" is "5h session", "Week, all models" is "Week, all". */
-function shortLabel(label: string): string {
-    return label
-        .replace(/(\d+)[- ]hours?/g, "$1h")
-        .replace(/(\d+) days?/g, "$1d")
-        .replace(/(\d+) minutes?/g, "$1m")
-        .replace(", all models", ", all")
-        .replace(", shared pool", ", pool")
-        .replace(/^Web tools, /, "Web ");
-}
-
-/** "4d 17h", "2h 52m", "9m": how long until a reset, from `now`. */
-function until(time: number, now: number): string {
-    const minutes = Math.max(0, Math.round((time - now) / 60_000));
-    const days = Math.floor(minutes / 1440);
-    const hours = Math.floor((minutes % 1440) / 60);
-    const rest = minutes % 60;
-
-    if (minutes === 0) {
-        return "now";
-    }
-
-    if (days > 0) {
-        return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
-    }
-
-    return hours > 0 ? (rest > 0 ? `${hours}h ${rest}m` : `${hours}h`) : `${rest}m`;
-}
-
-/** Money in its own currency's sign, or its code and number when that code is not one Node knows. */
-function money(amount: number, currency: string): string {
-    try {
-        return new Intl.NumberFormat("en-US", {
-            style: "currency",
-            currency: currency || "CNY",
-            currencyDisplay: "narrowSymbol",
-        }).format(amount);
-    } catch {
-        return `${currency} ${amount.toFixed(2)}`.trim();
-    }
-}
-
-/**
- * The usage as a command's card: plain text in a mono font, so it is laid out in columns. Each plan is a titled rule,
- * each limit a row with a gauge of squares (as on the page), how full it is, and how long until it resets. A mark in the
- * margin tells what color tells on the page: `!` for a warning, `!!` for critical, `▸` the limit in force.
- */
-export function usageCard(data: { at: number; reports: Report[] }, now = Date.now()): string {
-    // A service that this machine has no account for is no news in a card that others read: the page still says so.
-    const shown = data.reports.filter((report) => report.ok || !report.missing);
-    const rows = shown.flatMap((report) => (report.ok ? report.limits : []));
-    const label = Math.min(16, Math.max(8, ...rows.map((each) => shortLabel(each.label).length)));
-    const resets = rows.map((each) => Date.parse(each.resetsAt ?? ""));
-    const reset = Math.max(
-        0,
-        ...resets.map((at) => (Number.isFinite(at) ? until(at, now).length : 0)),
-    );
-    // Room for the gauge: what the other columns leave of the width, 6 to 12 blocks.
-    const cells = Math.min(12, Math.max(6, CARD_WIDTH - (3 + label + 1 + 1 + 4 + 2 + reset)));
-    const width = 3 + label + 1 + cells + 1 + 4 + (reset > 0 ? 2 + reset : 0);
-    const marks = new Set<string>();
-    const lines: string[] = [];
-
-    const rule = (name: string, tag = "") =>
-        `${name} ${"─".repeat(Math.max(3, width - name.length - (tag ? tag.length + 2 : 1)))}${tag ? ` ${tag}` : ""}`;
-
-    for (const report of shown) {
-        if (!report.ok) {
-            lines.push(rule(report.name, "unavailable"), `   ${report.error}`);
-
-            continue;
-        }
-
-        lines.push(rule(report.name));
-
-        if (report.balance) {
-            const { total, currency, enough } = report.balance;
-
-            lines.push(
-                `   ${money(total, currency)} left · ${enough ? "available" : "not enough for calls"}`,
-            );
-        }
-
-        if (report.limits.length === 0 && !report.balance) {
-            lines.push("   No limits reported.");
-        }
-
-        for (const limit of report.limits) {
-            const percent = Math.round(percentOf(limit.percent));
-            const lit =
-                percent <= 0
-                    ? 0
-                    : // At least one square for any use, and all of them only when it is full.
-                      Math.min(
-                          percent < 100 ? cells - 1 : cells,
-                          Math.max(1, Math.round(percent / (100 / cells))),
-                      );
-            const at = Date.parse(limit.resetsAt ?? "");
-            const mark =
-                limit.level === "critical"
-                    ? "!! "
-                    : limit.level === "warning"
-                      ? "!  "
-                      : limit.binding
-                        ? "▸  "
-                        : "   ";
-            let name = shortLabel(limit.label);
-
-            if (name.length > label) {
-                name = `${name.slice(0, label - 1)}…`;
-            }
-
-            if (mark.trim() !== "") {
-                marks.add(mark.trim());
-            }
-
-            lines.push(
-                `${mark}${name.padEnd(label)} ${"■".repeat(lit)}${"□".repeat(cells - lit)} ${`${percent}%`.padStart(4)}${
-                    Number.isFinite(at) ? `  ${until(at, now).padStart(reset)}` : ""
-                }`.trimEnd(),
-            );
-        }
-    }
-
-    if (shown.length === 0) {
-        lines.push("No plans reported: sign in under Menu → Providers.");
-    }
-
-    const key = [
-        marks.has("▸") && "▸ in force",
-        marks.has("!") && "! warning",
-        marks.has("!!") && "!! critical",
-    ].filter(Boolean);
-    const read = new Date(data.at).toLocaleString("en-US", {
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-        timeZoneName: "short",
-    });
-
-    const foot = [...key, `read ${read}`].join(" · ");
-
-    // The key and the time on one line when they fit: a card shows its last 12 lines until opened.
-    lines.push(
-        "─".repeat(width),
-        ...(foot.length <= width
-            ? [foot]
-            : [...(key.length > 0 ? [key.join(" · ")] : []), `Read ${read}`]),
-    );
-
-    return lines.join("\n");
-}
-
 /** Words this module wrote itself, safe to show. Anything else that goes wrong is told in fixed words. */
 class Said extends Error {
-    /** This machine has no account for the service, so a card that others read leaves the service out. */
+    /** This machine has no account for the service, so the page leaves the service out. */
     readonly missing: boolean;
 
     constructor(message: string, missing = false) {
@@ -367,7 +210,7 @@ function resetOf(value: unknown): { resetsAt?: string } {
         : {};
 }
 
-/** A report that failed: what its line in the card says, in the words that `failed` chose, and whether a card must
+/** A report that failed: what its line on the page says, in the words that `failed` chose, and whether the page must
  * leave it out. */
 function failure(error: unknown): { ok: false; error: string; missing?: boolean } {
     return {
@@ -377,7 +220,7 @@ function failure(error: unknown): { ok: false; error: string; missing?: boolean 
     };
 }
 
-/** A service's failure in words for its card, which names the service: never what the service sent back. */
+/** A service's failure in words for its plan on the page, which names the service: never what the service sent back. */
 function failed(error: unknown): string {
     if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
         return `No answer in ${TIMEOUT_MS / 1000} s.`;
@@ -1443,8 +1286,8 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
             ])
         )
             .filter((report): report is Report => report !== undefined)
-            // Every answer hides the limits that a used-up longer one makes moot: the page, the panel, the card, and
-            // the status item read the same list.
+            // Every answer hides the limits that a used-up longer one makes moot: the page, the panel, and the status
+            // item read the same list.
             .map((report) => (report.ok ? { ...report, limits: standingLimits(report.limits) } : report))
             // The plans that answered first, each group in its own order: what failed goes to the end.
             .sort((a, b) => Number(b.ok) - Number(a.ok));
@@ -1512,22 +1355,5 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
         );
     }
 
-    // /usage-plans: the same answer as a card in the session. The owner's alone, as the page is: it reads their
-    // sign-ins. The card shows to everyone in the session, as each command's card does.
-    web.command("usage-plans", {
-        description: "Show how much of each plan is used, and when it resets",
-        scope: "global",
-        handler: async (_args, ctx) => {
-            const stopped = new Promise<never>((_, reject) => {
-                ctx.signal.addEventListener("abort", () => reject(ctx.signal.reason), {
-                    once: true,
-                });
-            });
-
-            stopped.catch(() => {});
-
-            return { type: "card", output: usageCard(await Promise.race([usage(true), stopped])) };
-        },
-    });
     web.client("subscription-usage");
 }
