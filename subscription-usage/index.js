@@ -76,6 +76,24 @@ function lit(percent) {
     return percent < 100 ? Math.min(n, CELLS - 1) : CELLS;
 }
 
+/**
+ * How far a limit is into its window, in percent: null when the service gives no length for the window or no reset, as
+ * for a rolling window, which moves with every call.
+ */
+function windowShare(limit, now = Date.now()) {
+    const span = Number(limit.windowMs);
+    const reset = Date.parse(limit.resetsAt ?? "");
+
+    if (!Number.isFinite(span) || !(span > 0) || !Number.isFinite(reset)) {
+        return null;
+    }
+
+    // A reset behind us is a window the service has not rolled yet: all of it has passed.
+    const left = Math.max(0, Math.min(span, reset - now));
+
+    return Math.round(100 - (left / span) * 100);
+}
+
 /** Money as the browser writes it, or its code and number when that code is not one it knows. */
 function money(value, currency) {
     const amount = Number(value) || 0;
@@ -261,24 +279,40 @@ export default function setup(pocket) {
 
     pocket.style("look.css");
 
-    /** A plan's limit: its name, a gauge of squares, how full it is, and when it resets, in a word on the right. */
+    /**
+     * A plan's limit: its name, a gauge of squares, how full it is, and when it resets, in a word on the right. Under
+     * the gauge, a line says how much of the window has passed, so a gauge that runs past it is outpacing the window.
+     */
     function LimitRow({ limit, label = limit.label }) {
         const reset = Date.parse(limit.resetsAt ?? "");
         const percent = Number(limit.percent) || 0;
         const on = lit(percent);
         const timed = Number.isFinite(reset);
+        const share = windowShare(limit);
 
         return html`<li class=${`su-limit su-${limit.level}`}>
             <span class="su-label">${label}</span>
-            <span class="su-gauge" aria-hidden="true">
-                ${Array.from(
-                    { length: CELLS },
-                    (_, at) =>
-                        html`<span
-                            class=${at < on ? "su-cell su-on" : "su-cell"}
-                            style=${`--c:${at}`}
-                        ></span>`,
-                )}
+            <span class="su-meter">
+                <span class="su-gauge" aria-hidden="true">
+                    ${Array.from(
+                        { length: CELLS },
+                        (_, at) =>
+                            html`<span
+                                class=${at < on ? "su-cell su-on" : "su-cell"}
+                                style=${`--c:${at}`}
+                            ></span>`,
+                    )}
+                </span>
+                ${
+                    share !== null &&
+                    html`<span
+                        class="su-pace"
+                        style=${`--at:${share}%`}
+                        aria-hidden="true"
+                        title=${`${share}% of the window has passed`}
+                        ><i></i
+                    ></span>`
+                }
             </span>
             <span class="su-when">
                 ${
@@ -299,7 +333,9 @@ export default function setup(pocket) {
             </span>
             <span class="su-value"
                 >${Math.round(percent)}<span class="su-unit">%</span
-                ><span class="su-sr"> used</span></span
+                ><span class="su-sr"
+                    >${share === null ? " used" : ` used, ${share}% into the window`}</span
+                ></span
             >
         </li>`;
     }
