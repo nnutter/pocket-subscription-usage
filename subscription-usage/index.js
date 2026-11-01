@@ -89,6 +89,16 @@ function windowShare(limit, now = Date.now()) {
     return Math.round(100 - (left / span) * 100);
 }
 
+/**
+ * How far a limit lags its window: the share of the window that has passed, and the points that use is behind it (a
+ * negative number when use is ahead of the window). Null when the service gives no clock, as for a rolling window.
+ */
+function lagOf(limit) {
+    const share = windowShare(limit);
+
+    return share === null ? null : { share, points: share - (Number(limit.percent) || 0) };
+}
+
 /** Money as the browser writes it, or its code and number when that code is not one it knows. */
 function money(value, currency) {
     const amount = Number(value) || 0;
@@ -280,11 +290,9 @@ function lagging(report) {
     }
 
     const limit = longest(report.limits);
-    const share = limit === undefined ? null : windowShare(limit);
+    const lag = limit === undefined ? null : lagOf(limit);
 
-    return (
-        share !== null && share >= LAG_AFTER && (Number(limit.percent) || 0) <= share - LAG_POINTS
-    );
+    return lag !== null && lag.share >= LAG_AFTER && lag.points >= LAG_POINTS;
 }
 
 export default function setup(pocket) {
