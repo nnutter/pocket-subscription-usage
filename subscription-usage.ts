@@ -326,6 +326,27 @@ function levelOf(percent: number, said?: unknown): Level {
     return percent >= 90 ? "critical" : percent >= 75 ? "warning" : "ok";
 }
 
+/** Whether a limit is used up: nothing of its window is left. */
+const usedUp = (limit: Limit) => percentOf(limit.percent) >= 100;
+
+/**
+ * A plan's limits without the ones that no longer matter: when a limit with a longer window is used up, a shorter one
+ * cannot matter until the longer one resets, so it is left out. A limit whose window the service does not give stays.
+ */
+function standingLimits(limits: Limit[]): Limit[] {
+    const full = limits.filter(usedUp);
+
+    return limits.filter(
+        (limit) =>
+            !full.some(
+                (other) =>
+                    other.windowMs !== undefined &&
+                    limit.windowMs !== undefined &&
+                    other.windowMs > limit.windowMs,
+            ),
+    );
+}
+
 /** A reset time from milliseconds since 1970, as Z.ai gives it. */
 function resetOfMs(value: unknown): { resetsAt?: string } {
     return resetOf(typeof value === "number" ? value / 1000 : value);
@@ -1422,6 +1443,9 @@ export default function createSubscriptionUsage(_host: unknown, web: Web) {
             ])
         )
             .filter((report): report is Report => report !== undefined)
+            // Every answer hides the limits that a used-up longer one makes moot: the page, the panel, the card, and
+            // the status item read the same list.
+            .map((report) => (report.ok ? { ...report, limits: standingLimits(report.limits) } : report))
             // The plans that answered first, each group in its own order: what failed goes to the end.
             .sort((a, b) => Number(b.ok) - Number(a.ok));
 
