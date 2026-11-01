@@ -1,8 +1,8 @@
 /*
  * Subscription usage: each plan as a titled rule, then a row for each limit: its name, a gauge of small squares (the
- * home screen's color swatches), when it resets in words, and how full it is. A prepaid account shows the money left
- * instead of a gauge. Every color is one of the app's theme tokens, so it follows each theme, and its room follows
- * Appearance's density.
+ * home screen's color swatches) with the window's own clock under it, when it resets in words, and how full it is. A
+ * prepaid account shows the money left instead of a gauge. Every color is one of the app's theme tokens, so it follows
+ * each theme, and its room follows Appearance's density.
  */
 .su {
     width: 100%;
@@ -96,8 +96,16 @@
     overflow-wrap: anywhere;
 }
 
-.su-gauge {
+/* The gauge, with the window's own clock as a line under it. */
+.su-meter {
     grid-area: gauge;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+}
+
+.su-gauge {
     display: flex;
     gap: 2px;
     min-width: 0;
@@ -124,6 +132,35 @@
 
 .su-limit.su-critical {
     --su-tone: var(--err);
+}
+
+/* How much of the window has passed, under its gauge: as long as the gauge, and quieter than the squares, so a gauge
+ * that runs past this line reads as outpacing the window and one that stops short of it as lagging. */
+.su-pace {
+    position: relative;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--hair-2);
+    overflow: hidden;
+}
+
+.su-pace > i {
+    position: absolute;
+    inset-block: 0;
+    left: 0;
+    width: var(--at);
+    border-radius: inherit;
+    background: var(--muted);
+}
+
+/* A limit that is behind its window: its line takes the warning's color, in two steps, so the page shows which plans
+ * are close to leaving quota unused. */
+.su-pace.su-warn > i {
+    background: var(--warn);
+}
+
+.su-pace.su-far > i {
+    background: var(--err);
 }
 
 /* When it resets: small and quiet, so the gauge and its percent come first. */
@@ -366,6 +403,16 @@
     }
 
     .su .su-cell.su-on {
+        forced-color-adjust: none;
+        background: Highlight;
+    }
+
+    .su-pace {
+        forced-color-adjust: none;
+        background: CanvasText;
+    }
+
+    .su .su-pace > i {
         forced-color-adjust: none;
         background: Highlight;
     }

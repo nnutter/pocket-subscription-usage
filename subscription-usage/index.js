@@ -1,8 +1,8 @@
-// Subscription usage's browser module: a rail button (with the fullest limit on it once one passes 80%), a launcher
-// action, a page (and a panel) with each plan's limits as rows of small squares (the home screen's color swatches) with
-// how full each is and when it resets, and a prepaid account's balance (DeepSeek, Ollama Cloud) as money left. The plans
-// that are fullest against their window's clock come first, and a footer says how old the reading is. It also adds a
-// status line item with the quota of the current model's provider.
+// Subscription usage's browser module: a rail button (with the number of plans whose quota may go unused on it, those
+// behind their window), a launcher action, a page (and a panel) with each plan's limits as rows of small squares (the
+// home screen's color swatches) with how full each is and when it resets, and a prepaid account's balance (DeepSeek,
+// Ollama Cloud) as money left. The plans that are fullest against their window's clock come first, and a footer says how
+// old the reading is. It also adds a status line item with the quota of the current model's provider.
 // The server module asks the services; this only shows what it says.
 
 export const pocketApi = 1;
@@ -24,6 +24,12 @@ const BADGE_EVERY_MS = 5 * 60_000;
 const QUOTA_EVERY_MS = 30_000;
 /** A reset further away than this shows its date, not only its weekday. */
 const NEAR_MS = 6 * 86_400_000;
+/** The points a limit must be behind its window by before its line turns yellow, and a plan before the rail counts it. */
+const LAG_POINTS = 5;
+/** The points a limit must be behind its window by before its line turns red. */
+const LAG_FAR_POINTS = 15;
+/** How far a window must run before a lag says anything: a window that just started lags in every plan. */
+const LAG_AFTER = 50;
 /** The squares in a gauge: each is 5% of a limit. */
 const CELLS = 20;
 /** What "In force" on a limit means. */
@@ -56,15 +62,6 @@ const when = (time) =>
             : { weekday: "short", hour: "numeric", minute: "2-digit" },
     );
 
-/** The fullest limit across the plans that answered, in percent. */
-const fullest = (data) =>
-    Math.max(
-        0,
-        ...(data?.reports ?? []).flatMap((report) =>
-            report.ok ? report.limits.map((each) => Number(each.percent) || 0) : [],
-        ),
-    );
-
 /** How many of a gauge's squares are lit: at least one for any use, and not all of them until a limit is full. */
 function lit(percent) {
     if (percent <= 0) {
@@ -74,6 +71,34 @@ function lit(percent) {
     const n = Math.max(1, Math.round(percent / (100 / CELLS)));
 
     return percent < 100 ? Math.min(n, CELLS - 1) : CELLS;
+}
+
+/**
+ * How far a limit is into its window, in percent: null when the service gives no length for the window or no reset, as
+ * for a rolling window, which moves with every call.
+ */
+function windowShare(limit, now = Date.now()) {
+    const span = Number(limit.windowMs);
+    const reset = Date.parse(limit.resetsAt ?? "");
+
+    if (!Number.isFinite(span) || !(span > 0) || !Number.isFinite(reset)) {
+        return null;
+    }
+
+    // A reset behind us is a window the service has not rolled yet: all of it has passed.
+    const left = Math.max(0, Math.min(span, reset - now));
+
+    return Math.round(100 - (left / span) * 100);
+}
+
+/**
+ * How far a limit lags its window: the share of the window that has passed, and the points that use is behind it (a
+ * negative number when use is ahead of the window). Null when the service gives no clock, as for a rolling window.
+ */
+function lagOf(limit) {
+    const share = windowShare(limit);
+
+    return share === null ? null : { share, points: share - (Number(limit.percent) || 0) };
 }
 
 /** Money as the browser writes it, or its code and number when that code is not one it knows. */
@@ -256,29 +281,73 @@ function rank(report) {
     return limit === undefined ? [1, 0] : [0, Number(limit.percent) || 0];
 }
 
+/**
+ * Whether a plan is behind its window, where its quota may go unused: its longest limit, once that window is past
+ * `LAG_AFTER` percent over, is `LAG_POINTS` or more under the share of the window that has passed. A plan with no window
+ * clock has nothing to be behind, and one that failed is not judged.
+ */
+function lagging(report) {
+    if (!report.ok) {
+        return false;
+    }
+
+    const limit = longest(report.limits);
+    const lag = limit === undefined ? null : lagOf(limit);
+
+    return lag !== null && lag.share >= LAG_AFTER && lag.points >= LAG_POINTS;
+}
+
 export default function setup(pocket) {
     const { html, useEffect, useState, Icon, Loader, Spinner } = pocket;
 
     pocket.style("look.css");
 
-    /** A plan's limit: its name, a gauge of squares, how full it is, and when it resets, in a word on the right. */
+    /**
+     * A plan's limit: its name, a gauge of squares, how full it is, and when it resets, in a word on the right. Under
+     * the gauge, a line says how much of the window has passed, so a gauge that runs past it is outpacing the window; it
+     * turns yellow and then red as use falls further behind the window, where quota may go unused.
+     */
     function LimitRow({ limit, label = limit.label }) {
         const reset = Date.parse(limit.resetsAt ?? "");
         const percent = Number(limit.percent) || 0;
         const on = lit(percent);
         const timed = Number.isFinite(reset);
+        const lag = lagOf(limit);
+        const gap = lag === null ? 0 : Math.round(lag.points);
+        const behind = gap >= LAG_POINTS;
+        const far = gap >= LAG_FAR_POINTS;
+        const spoken =
+            lag === null
+                ? " used"
+                : ` used, ${lag.share}% into the window${behind ? `, ${gap} points behind` : ""}`;
+        const paceTitle =
+            lag === null
+                ? ""
+                : `${lag.share}% of the window has passed${behind ? `: use is ${gap} points behind` : ""}`;
 
         return html`<li class=${`su-limit su-${limit.level}`}>
             <span class="su-label">${label}</span>
-            <span class="su-gauge" aria-hidden="true">
-                ${Array.from(
-                    { length: CELLS },
-                    (_, at) =>
-                        html`<span
-                            class=${at < on ? "su-cell su-on" : "su-cell"}
-                            style=${`--c:${at}`}
-                        ></span>`,
-                )}
+            <span class="su-meter">
+                <span class="su-gauge" aria-hidden="true">
+                    ${Array.from(
+                        { length: CELLS },
+                        (_, at) =>
+                            html`<span
+                                class=${at < on ? "su-cell su-on" : "su-cell"}
+                                style=${`--c:${at}`}
+                            ></span>`,
+                    )}
+                </span>
+                ${
+                    lag !== null &&
+                    html`<span
+                        class=${`su-pace${far ? " su-far" : behind ? " su-warn" : ""}`}
+                        style=${`--at:${lag.share}%`}
+                        aria-hidden="true"
+                        title=${paceTitle}
+                        ><i></i
+                    ></span>`
+                }
             </span>
             <span class="su-when">
                 ${
@@ -299,7 +368,7 @@ export default function setup(pocket) {
             </span>
             <span class="su-value"
                 >${Math.round(percent)}<span class="su-unit">%</span
-                ><span class="su-sr"> used</span></span
+                ><span class="su-sr">${spoken}</span></span
             >
         </li>`;
     }
@@ -507,11 +576,11 @@ export default function setup(pocket) {
         page: "usage",
     });
 
-    /** The rail's button shows the fullest limit once one passes 80%. */
+    /** The rail's button counts the plans that are behind their window, where their quota may go unused. */
     function badge(data) {
-        const top = Math.round(fullest(data));
+        const behind = (data?.reports ?? []).filter(lagging).length;
 
-        rail.update({ badge: top >= 80 ? top : null });
+        rail.update({ badge: behind > 0 ? behind : null });
     }
 
     pocket.page({ id: "usage", title: "Quotas", component: Usage });
